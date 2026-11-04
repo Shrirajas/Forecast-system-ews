@@ -1,0 +1,33 @@
+# --- Core ML & acceleration -------------------------------------------------
+# CUDA build for an RTX 4080 Super (Ada, sm_89):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# (PyPI's default Linux wheel also bundles CUDA; CPU-only boxes work unchanged.)
+torch>=2.6
+torchvision
+torchaudio
+timesfm[torch]>=3.0.2      # optional pretrained TimesFM 3.0 backend
+transformers>=4.45
+accelerate>=1.0            # the directive's "accelerator" is the HF `accelerate` package
+optuna>=4.0
+numpy>=2.0
+pandas>=2.2
+scikit-learn>=1.5
+
+# --- Backend & data layer -----------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+pydantic-settings>=2.4
+python-multipart>=0.0.9    # streaming multipart uploads for /api/v1/ingest/file
+pyarrow>=17
+duckdb>=1.1
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# --- Distributed compute & monitoring ----------------------------------------
+ray[default]>=2.40
+loguru>=0.7
+
+# --- Dev / test ------------------------------------------------------------------
+httpx>=0.27
+pytest>=8

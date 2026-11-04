@@ -1,0 +1,108 @@
+"""Training windows sliced lazily from the memory-mapped vector cache.
+
+The memmaps are (re)opened inside each DataLoader worker, so datasets pickle
+cheaply under the ``spawn`` start method (Windows / CUDA) instead of copying
+the arrays into every worker.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from utils.device import DeviceContext
+
+
+@dataclass
+class WindowSpec:
+    context: int
+    horizon: int  # supervised days (e.g. 90)
+    horizon_pad: int  # model output length (multiple of patch length)
+
+
+class CacheWindowDataset(Dataset):
+    def __init__(self, cache_dir: Path, index: np.ndarray, spec: WindowSpec):
+        """``index`` is ``[n, 2]`` of (account row, cutoff day) where the cutoff
+        is the first forecast day; context = ``[cutoff - L, cutoff)``."""
+        self.cache_dir = Path(cache_dir)
+        self.index = index.astype(np.int64)
+        self.spec = spec
+        self._past = None
+        self._known = None
+
+    def _open(self) -> None:
+        if self._past is None:
+            self._past = np.load(self.cache_dir / "past.npy", mmap_mode="r")
+            self._known = np.load(self.cache_dir / "known.npy", mmap_mode="r")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_past"] = state["_known"] = None
+        return state
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, i: int):
+        self._open()
+        row, cut = self.index[i]
+        L, H, Hp = self.spec.context, self.spec.horizon, self.spec.horizon_pad
+        lo = cut - L
+        past = np.full((L, self._past.shape[2]), np.nan, dtype=np.float32)
+        known = np.zeros((L + Hp, self._known.shape[2]), dtype=np.float32)
+        s = max(lo, 0)
+        past[s - lo :] = self._past[row, s:cut]
+        known[s - lo :] = self._known[row, s : cut + Hp]
+        future = np.full((Hp, 2), np.nan, dtype=np.float32)
+        end = min(cut + H, self._past.shape[1])
+        future[: end - cut] = self._past[row, cut:end, :2]
+        return torch.from_numpy(past), torch.from_numpy(known), torch.from_numpy(future)
+
+
+def build_window_index(
+    n_accounts: int,
+    n_days: int,
+    spec: WindowSpec,
+    stride: int,
+    val_fraction: float,
+    seed: int,
+    min_context: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Account-level holdout: validation accounts are never seen in training."""
+    min_ctx = min_context or spec.context // 2
+    cuts = np.arange(min_ctx, n_days - spec.horizon + 1, stride)
+    if cuts.size == 0:
+        raise ValueError(f"need at least {min_ctx + spec.horizon} days of history to train, have {n_days}")
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_accounts)
+    n_val = int(round(n_accounts * val_fraction)) if n_accounts > 1 else 0
+    val_rows, train_rows = perm[:n_val], perm[n_val:]
+
+    def grid(rows: np.ndarray, cut_set: np.ndarray) -> np.ndarray:
+        if rows.size == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        r, c = np.meshgrid(rows, cut_set, indexing="ij")
+        return np.stack([r.ravel(), c.ravel()], axis=1)
+
+    # validate on the most recent cutoffs (the regime the EWS is scored on)
+    val_cuts = cuts[-max(1, len(cuts) // 4) :]
+    return grid(train_rows, cuts), grid(val_rows, val_cuts)
+
+
+def make_loader(
+    ds: CacheWindowDataset, batch_size: int, shuffle: bool, ctx: DeviceContext, num_workers: int
+) -> DataLoader:
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=shuffle and len(ds) > batch_size,
+        num_workers=num_workers,
+        pin_memory=ctx.pin_memory,  # page-locked host buffers -> async H2D copies on CUDA
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )

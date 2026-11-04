@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Generated data, caches and model artifacts (reproducible via scripts/bootstrap.py)
+data/
+artifacts/
+*.duckdb
+*.duckdb.wal
+
+# Node / Next.js
+node_modules/
+.next/
+.env*.local
+.env
