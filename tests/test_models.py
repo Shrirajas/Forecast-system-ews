@@ -204,9 +204,9 @@ def test_timesfm3_adapter_with_tiny_random_model(tiny_timesfm):
     assert n_targets == [1, 1, 2, 2, 2]  # the two CASA-only accounts forecast balance alone
     assert np.all(q[[1, 3], 1] == 0.0)  # ...and get a zero utilisation track
     lengths = sorted(c["contexts"][i].shape[1] for c in calls for i in range(len(c["contexts"])))
-    assert lengths == [112, 312, 512, 512, 512]  # leading NaNs stripped
-    for c in calls:  # one patch-rounded length per library call
-        assert len({-(-x.shape[1] // 32) for x in c["contexts"]}) == 1
+    assert lengths == [96, 288, 512, 512, 512]  # leading NaNs stripped, trimmed to whole patches
+    for c in calls:  # one exact length per library call: nothing to pad
+        assert len({x.shape[1] for x in c["contexts"]}) == 1
     # results come back in the caller's order despite grouping and sorting
     med = q[:, 0, :, 4].mean(1)
     assert list(np.argsort(med)) == [0, 3, 1, 4, 2]
@@ -231,3 +231,43 @@ def test_timesfm3_forecast_does_not_depend_on_batch_neighbours(tiny_timesfm):
     for i in range(len(past)):
         alone = eng.forecast(past[i : i + 1], known[i : i + 1], 30)
         np.testing.assert_allclose(alone[0], together[i], rtol=1e-4, atol=1e-3)
+
+
+def test_timesfm3_same_bucket_lengths_are_exact(tiny_timesfm):
+    """Histories of 300 and 318 days fall in the same patch bucket; with trimming the
+    library never pads, so each account's forecast is bit-identical alone or mixed."""
+    from models.engine import TimesFM3Engine
+
+    eng = TimesFM3Engine("u", get_device_context(force_cpu=True), 512, 96, forecaster=tiny_timesfm)
+    past, known = _book(3)
+    past[0, : 512 - 300] = np.nan
+    past[2, : 512 - 318] = np.nan
+    mixed = eng.forecast(past, known, 30)
+    for i in range(len(past)):
+        np.testing.assert_array_equal(eng.forecast(past[i : i + 1], known[i : i + 1], 30)[0], mixed[i])
+
+
+def test_timesfm3_credit_line_flag_overrides_history(tiny_timesfm):
+    from models.engine import TimesFM3Engine
+
+    eng = TimesFM3Engine("u", get_device_context(force_cpu=True), 512, 96, forecaster=tiny_timesfm)
+    calls = []
+    real = eng.model.predict_batch
+    eng.model.predict_batch = lambda **kw: (calls.append(kw), real(**kw))[1]
+    past, known = _book(4)
+    past[:, :, 1] = 0.0  # nobody has ever drawn on a line ...
+    lines = np.array([True, False, True, False, False])  # ... but accounts 0 and 2 have one
+    q = eng.forecast(past, known, 30, has_credit_line=lines)
+    assert np.all(q[~lines, 1] == 0.0)
+    # undrawn lines are still forecast as a second target, not assumed to be zero
+    assert sorted(x.shape[0] for c in calls for x in c["contexts"]) == [1, 1, 1, 2, 2]
+
+
+def test_timesfm3_requires_licence_ack_in_any_environment():
+    from config.settings import ModelSettings, Settings
+    from models.engine import get_engine, reset_engine
+
+    reset_engine()
+    with pytest.raises(RuntimeError, match="non-commercial"):
+        get_engine(Settings(environment="sandbox", model=ModelSettings(backend="timesfm3")))
+    reset_engine()

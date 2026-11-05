@@ -136,14 +136,14 @@ class EWSPipeline:
         L, Hp = eng.context_length, eng.horizon_pad
         win = cache.window(rows, as_of, L, Hp)
         past, known = win["past"], win["known"]
-        q = eng.forecast(past, known, horizon)
+        acc = cache.accounts.iloc[rows]
+        q = eng.forecast(past, known, horizon, has_credit_line=acc["credit_limit"].fillna(0).to_numpy(float) > 0)
         # Physical bounds: deposit balances that never went negative stay >= 0;
         # utilisation lives in [0, max_utilization] (small over-limit allowed).
         nonneg = ~(np.nan_to_num(past[:, :, 0], nan=0.0) < 0).any(1)
         q[:, 0] = np.where(nonneg[:, None, None], np.maximum(q[:, 0], 0.0), q[:, 0])
         q[:, 1] = np.clip(q[:, 1], 0.0, MAX_UTILIZATION)
 
-        acc = cache.accounts.iloc[rows]
         last = past[:, -1, :]
         cib = past[:, :, CIBIL_CH]
         snap = AccountSnapshot(
