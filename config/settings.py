@@ -150,6 +150,13 @@ class Settings(BaseSettings):
     worker_threads: int = 4
     #: Build the tensor cache automatically when the API boots (if data exists).
     warm_cache_on_startup: bool = True
+    #: Score the whole book after every refresh (and at startup when no stored run
+    #: matches the current data), so whole-book reads never run the model.
+    rescore_after_refresh: bool = True
+    #: Horizons stored for whole-book reads; one forward pass serves all of them.
+    book_horizons: tuple[int, ...] = (30, 60, 90)
+    #: Accounts per shard when scoring the whole book (bounds memory on large books).
+    book_shard_size: int = 50_000
 
     storage: StorageSettings = Field(default_factory=StorageSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
