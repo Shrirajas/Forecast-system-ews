@@ -32,6 +32,9 @@ managers through a FastAPI service.
 
 ## Quick start
 
+Step-by-step setup for your own PC (Windows/macOS/Linux, GPU or CPU): [`docs/RUNNING_LOCALLY.md`](docs/RUNNING_LOCALLY.md).
+Runbook to hand to an AI coding agent: [`AGENTS.md`](AGENTS.md).
+
 ```bash
 python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
