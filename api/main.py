@@ -28,6 +28,9 @@ from utils.logging import logger, setup_logging
 
 def _warm(pipeline: EWSPipeline) -> None:
     try:
+        removed = pipeline.alerts.cleanup_orphans()
+        if any(removed.values()):
+            logger.info("removed rows of unfinished runs: {}", removed)
         has_data = pipeline.storage.scalar("SELECT COUNT(*) FROM daily_balances")
         if has_data:
             pipeline.refresh()

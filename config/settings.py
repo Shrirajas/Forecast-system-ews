@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     book_horizons: tuple[int, ...] = (30, 60, 90)
     #: Accounts per shard when scoring the whole book (bounds memory on large books).
     book_shard_size: int = 50_000
+    #: The one book horizon that raises alerts; the others only store scores.
+    book_alert_horizon: int = 90
+    #: Stored book runs kept per horizon; older runs' per-account scores are deleted.
+    keep_book_runs: int = 3
 
     storage: StorageSettings = Field(default_factory=StorageSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)

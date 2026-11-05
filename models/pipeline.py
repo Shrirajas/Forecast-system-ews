@@ -20,7 +20,7 @@ import pyarrow as pa
 from config.settings import QUANTILES, Settings
 from data_engine.aggregation import FeatureAggregator
 from data_engine.alerts import AlertStore, utcnow
-from data_engine.schema import EWS_ALERTS, conform
+from data_engine.schema import ACCOUNT_SCORES, EWS_ALERTS, conform
 from data_engine.storage import StorageAdapter, get_storage
 from data_engine.vector_cache import CIBIL_CH, PAST_CHANNELS, LoadedCache, VectorCache
 from models.behavior import BehaviorResult, evaluate_behavior
@@ -90,6 +90,7 @@ class EWSPipeline:
         self._engine = engine
         self.alerts = AlertStore(self.storage)
         self._refresh_lock = threading.Lock()
+        self._book_lock = threading.Lock()
 
     @property
     def engine(self) -> ForecastEngine:
@@ -131,13 +132,20 @@ class EWSPipeline:
         horizon: int,
         liability_quantile: float,
         asset_quantile: float,
+        precomputed: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> ScoredBatch:
         eng = self.engine
         L, Hp = eng.context_length, eng.horizon_pad
-        win = cache.window(rows, as_of, L, Hp)
-        past, known = win["past"], win["known"]
         acc = cache.accounts.iloc[rows]
-        q = eng.forecast(past, known, horizon, has_credit_line=acc["credit_limit"].fillna(0).to_numpy(float) > 0)
+        if precomputed is None:
+            win = cache.window(rows, as_of, L, Hp)
+            past, known = win["past"], win["known"]
+            q = eng.forecast(
+                past, known, horizon, has_credit_line=acc["credit_limit"].fillna(0).to_numpy(float) > 0
+            )
+        else:  # a longer forecast already made for these rows: the first `horizon` days are the same
+            q_full, past, known = precomputed
+            q = q_full[:, :, :horizon].copy()
         # Physical bounds: deposit balances that never went negative stay >= 0;
         # utilisation lives in [0, max_utilization] (small over-limit allowed).
         nonneg = ~(np.nan_to_num(past[:, :, 0], nan=0.0) < 0).any(1)
@@ -211,6 +219,10 @@ class EWSPipeline:
                 {"liability_quantile": req.liability_quantile, "asset_quantile": req.asset_quantile,
                  "accounts": None if req.account_ids is None else len(req.account_ids)}
             ),
+            "scope": "ACCOUNTS",  # request-time runs are never served as stored book results
+            "liability_quantile": req.liability_quantile,
+            "asset_quantile": req.asset_quantile,
+            "model_version": self.engine.model_version,
         }
 
     def alert_table(self, cache: LoadedCache, sb: ScoredBatch, run_id: str) -> pa.Table:
@@ -262,6 +274,109 @@ class EWSPipeline:
             return EWS_ALERTS.arrow_schema.empty_table()
         merged = {k: sum((p[k] for p in parts), []) for k in parts[0]}
         return conform(EWS_ALERTS, pa.table(merged))
+
+    def score_table(self, cache: LoadedCache, sb: ScoredBatch, run_id: str) -> pa.Table:
+        """Vectorised per-account results (everything a response holds except paths)."""
+        r, bh, sn = sb.risk, sb.behavior, sb.snapshot
+        acc = cache.accounts.iloc[sb.rows]
+        n = len(sb.rows)
+        base = np.datetime64(sb.as_of, "D")
+        in_sma = r.tier != "GREEN"
+
+        def days(x):
+            return pa.array(np.where(x > 0, x, 0).astype(np.int32), mask=x <= 0)
+
+        def dates(x):
+            return pa.array(base + np.where(x > 0, x, 0).astype("timedelta64[D]"), mask=x <= 0)
+
+        def num(x, nd=2, hide=None):
+            v = np.round(np.asarray(x, dtype=float), nd)
+            m = ~np.isfinite(v) if hide is None else (~np.isfinite(v) | hide)
+            return pa.array(np.where(m, 0.0, v), mask=m)
+
+        def text(col):
+            return pa.array([_s(x) for x in acc[col]] if col in acc else [None] * n, pa.string())
+
+        return conform(ACCOUNT_SCORES, pa.table({
+            "run_id": pa.array([run_id] * n),
+            "account_id": pa.array(acc["account_id"].astype(str).tolist()),
+            "rm_id": text("rm_id"), "segment": text("segment"), "product_type": text("product_type"),
+            "as_of_date": pa.array([sb.as_of] * n, pa.date32()),
+            "horizon": pa.array(np.full(n, sb.horizon, np.int32)),
+            "risk_tier": pa.array(r.tier.astype(str).tolist()),
+            "days_to_breach": days(r.days_to_breach), "breach_date": dates(r.days_to_breach),
+            "breach_shortfall": num(r.breach_shortfall, hide=~in_sma),
+            "days_to_zero": days(r.days_to_zero),
+            "current_balance": num(sn.current_balance), "current_utilization": num(sn.current_utilization, 4),
+            "next_emi_date": dates(r.next_emi_day),
+            "next_emi_amount": num(r.next_emi_amount, hide=r.next_emi_day <= 0),
+            "probability_of_default": num(r.pd, 4), "pd_cash_shortfall": num(r.pd_cash, 4),
+            "pd_utilization_breach": num(r.p_util, 4), "pd_bureau": num(r.pd_bureau, 4),
+            "exposure_at_default": num(r.ead), "loss_given_default": num(r.lgd, 4),
+            "expected_loss": num(r.expected_loss, hide=~in_sma), "priority_score": num(r.priority),
+            "cibil_score": num(sn.cibil, 0),
+            "triggers": pa.array([json.dumps(t) for t in r.triggers]),
+            "trailing_avg_balance_90d": num(bh.trailing_avg_90d), "baseline_avg_balance": num(bh.baseline_avg),
+            "projected_avg_balance": num(bh.projected_avg),
+            "projected_change_pct": num(bh.projected_change_pct * 100),
+            "projected_min_balance_worst_case": num(bh.projected_min_worst),
+            "trend": pa.array(bh.trend.astype(str).tolist()),
+            "attrition_alert": pa.array(bh.attrition_alert.astype(np.int16)),
+            "projected_balance_drop": num(bh.projected_balance_drop), "cof_impact_annual": num(bh.cof_impact_annual),
+        }))
+
+    def score_book(self, horizons: tuple[int, ...] | None = None, force: bool = False) -> dict[str, Any]:
+        """Score every account once per horizon and store the results for fast reads.
+
+        One forward pass at the longest horizon serves every horizon. Only
+        ``book_alert_horizon`` raises (and supersedes) alerts; the other runs
+        store scores only, so horizons never cancel each other's alerts."""
+        st, rs = self.settings, self.settings.risk
+        hs = tuple(sorted(set(horizons or st.book_horizons)))
+        alert_h = st.book_alert_horizon if st.book_alert_horizon in hs else max(hs)
+        with self._book_lock:
+            cache = self.loaded_cache(auto_refresh=False)
+            mv = self.engine.model_version
+            lq, aq = rs.liability_quantile, rs.asset_quantile
+            if not force and all(self.alerts.latest_book_run(cache.meta.version, h, lq, aq, mv) for h in hs):
+                return {"skipped": True, "reason": "stored runs already match the current data and model"}
+            t0 = time.perf_counter()
+            runs = {h: "run_" + uuid.uuid4().hex[:12] for h in hs}
+            totals = {h: {"n_alerts": 0, "el": 0.0} for h in hs}
+            ids = cache.accounts["account_id"].astype(str).to_numpy()
+            L, Hp, H = self.engine.context_length, self.engine.horizon_pad, max(hs)
+            for a in range(0, cache.n_accounts, st.book_shard_size):
+                rows = np.arange(a, min(a + st.book_shard_size, cache.n_accounts))
+                win = cache.window(rows, cache.end, L, Hp)
+                acc = cache.accounts.iloc[rows]
+                q = self.engine.forecast(
+                    win["past"], win["known"], H, has_credit_line=acc["credit_limit"].fillna(0).to_numpy(float) > 0
+                )
+                for h in hs:
+                    sb = self.score_rows(cache, rows, cache.end, h, lq, aq, precomputed=(q, win["past"], win["known"]))
+                    alerts = self.alert_table(cache, sb, runs[h]) if h == alert_h else EWS_ALERTS.arrow_schema.empty_table()
+                    self.alerts.write_shard(runs[h], ids[rows].tolist(), alerts, self.score_table(cache, sb, runs[h]))
+                    totals[h]["n_alerts"] += alerts.num_rows
+                    if alerts.num_rows:
+                        el = alerts.column("expected_loss").to_numpy(zero_copy_only=False)
+                        totals[h]["el"] += float(np.nansum(np.asarray(el, dtype=float)))
+            # Publish the alert horizon last, so the active list is never left without its alerts.
+            for h in sorted(hs, key=lambda x: x == alert_h):
+                self.alerts.finalize_run(
+                    {
+                        "run_id": runs[h], "created_at": utcnow(), "as_of_date": cache.end, "horizon": h,
+                        "backend": self.engine.name, "n_accounts": cache.n_accounts,
+                        "n_alerts": totals[h]["n_alerts"], "total_expected_loss": totals[h]["el"],
+                        "params": json.dumps({"alert_horizon": alert_h}), "scope": "BOOK",
+                        "cache_version": cache.meta.version, "liability_quantile": lq, "asset_quantile": aq,
+                        "model_version": mv,
+                    },
+                    supersede=h == alert_h,
+                )
+                self.alerts.prune_book_runs(h, st.keep_book_runs)
+            logger.info("book scored: {} accounts x horizons {} in {:.1f}s", cache.n_accounts, hs, time.perf_counter() - t0)
+            return {"runs": runs, "alert_horizon": alert_h, "alerts": totals[alert_h]["n_alerts"],
+                    "seconds": round(time.perf_counter() - t0, 2)}
 
     def _account_payloads(self, cache: LoadedCache, sb: ScoredBatch, req: ScoreRequest) -> list[dict[str, Any]]:
         r, bh, sn = sb.risk, sb.behavior, sb.snapshot

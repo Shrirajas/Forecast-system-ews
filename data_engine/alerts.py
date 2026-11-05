@@ -7,7 +7,7 @@ readers never see a half-applied run.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
@@ -29,19 +29,34 @@ class AlertStore:
         self, run_id: str, scope_account_ids: list[str], alerts: pa.Table, scores: pa.Table | None = None
     ) -> None:
         """Stage one shard of a run: alerts land as PENDING and stay invisible until finalize_run."""
+        now = utcnow()
+        n = len(scope_account_ids)
         self.storage.write_arrow(
             "run_scope",
-            conform(RUN_SCOPE, pa.table({"run_id": [run_id] * len(scope_account_ids), "account_id": scope_account_ids})),
+            conform(
+                RUN_SCOPE,
+                pa.table({"run_id": [run_id] * n, "account_id": scope_account_ids, "created_at": [now] * n}),
+            ),
             mode="ignore",
         )
         if alerts.num_rows:
             self.storage.write_arrow("ews_alerts", conform(EWS_ALERTS, alerts), mode="upsert")
         if scores is not None and scores.num_rows:
+            if "created_at" not in scores.column_names:
+                scores = scores.append_column("created_at", pa.array([now] * scores.num_rows, pa.timestamp("us")))
             self.storage.write_arrow("account_scores", conform(ACCOUNT_SCORES, scores), mode="upsert")
 
     def finalize_run(self, run: dict[str, Any], supersede: bool = True) -> None:
         """Atomically publish a staged run: supersede older alerts of its accounts,
-        activate its own alerts and record the run row."""
+        activate its own alerts and record the run row.
+
+        Book runs of several horizons should raise alerts from one of them only:
+        finalise the others with ``supersede=False`` and no alerts, otherwise
+        whichever horizon finishes last decides the active alert list."""
+        run = {**run}
+        for k in ("liability_quantile", "asset_quantile"):
+            if run.get(k) is not None:
+                run[k] = round(float(run[k]), 2)  # stored rounded: lookups compare rounded values
         run_id = run["run_id"]
         cols = ", ".join(run.keys())
         vals = ", ".join(f":{k}" for k in run)
@@ -61,6 +76,33 @@ class AlertStore:
             ("DELETE FROM run_scope WHERE run_id = :r", {"r": run_id}),
         ]
         self.storage.execute_many(stmts)
+
+    def prune_book_runs(self, horizon: int, keep: int) -> int:
+        """Delete stored scores of all but the newest ``keep`` book runs for a horizon.
+        Run rows stay as history; only the per-account rows are removed."""
+        old = self.storage.query_arrow(
+            "SELECT run_id FROM forecast_runs WHERE scope = 'BOOK' AND horizon = :h "
+            "ORDER BY created_at DESC LIMIT 1000000 OFFSET :k",
+            {"h": horizon, "k": max(keep, 1)},
+        ).column("run_id").to_pylist()
+        for rid in old:
+            self.storage.execute("DELETE FROM account_scores WHERE run_id = :r", {"r": rid})
+        return len(old)
+
+    def cleanup_orphans(self, older_than: timedelta = timedelta(hours=1)) -> dict[str, int]:
+        """Remove rows staged by runs that never finalised (crashed mid-way).
+
+        Readers only see finalised runs, so these are never served; this only
+        stops them piling up. Rows younger than ``older_than`` are kept, as
+        they may belong to a run still in progress in another process."""
+        cutoff = utcnow() - older_than
+        orphan = "run_id NOT IN (SELECT run_id FROM forecast_runs) AND created_at < :c"
+        counts = {}
+        for table, extra in (("ews_alerts", " AND status = 'PENDING'"), ("account_scores", ""), ("run_scope", "")):
+            counts[table] = int(self.storage.scalar(f"SELECT COUNT(*) FROM {table} WHERE {orphan}{extra}", {"c": cutoff}) or 0)
+            if counts[table]:
+                self.storage.execute(f"DELETE FROM {table} WHERE {orphan}{extra}", {"c": cutoff})
+        return counts
 
     def record_run(
         self,
@@ -114,14 +156,16 @@ class AlertStore:
         return True
 
     def latest_book_run(
-        self, cache_version: str, horizon: int, liability_q: float, asset_q: float, backend: str
+        self, cache_version: str, horizon: int, liability_q: float, asset_q: float, model_version: str
     ) -> dict[str, Any] | None:
-        """Most recent whole-book run that scored exactly the current data."""
+        """Most recent whole-book run that scored exactly the current data with exactly
+        the current weights (a retrain changes ``model_version``, so old runs stop matching)."""
         rows = self.storage.query_arrow(
             "SELECT * FROM forecast_runs WHERE scope = 'BOOK' AND cache_version = :v AND horizon = :h "
-            "AND liability_quantile = :lq AND asset_quantile = :aq AND backend = :b "
-            "ORDER BY created_at DESC LIMIT 1",
-            {"v": cache_version, "h": horizon, "lq": liability_q, "aq": asset_q, "b": backend},
+            "AND ROUND(liability_quantile, 2) = :lq AND ROUND(asset_quantile, 2) = :aq "
+            "AND model_version = :mv ORDER BY created_at DESC LIMIT 1",
+            {"v": cache_version, "h": horizon, "lq": round(float(liability_q), 2),
+             "aq": round(float(asset_q), 2), "mv": model_version},
         ).to_pylist()
         return rows[0] if rows else None
 

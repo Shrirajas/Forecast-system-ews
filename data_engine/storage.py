@@ -100,8 +100,12 @@ class StorageAdapter(ABC):
     def migrate(self) -> list[str]:
         """Add columns that newer releases declare but an existing database lacks.
 
-        Only nullable columns are ever added, so this is safe on live tables."""
-        added = []
+        Only nullable columns can be added safely to a live table; a missing
+        NOT NULL column means the database needs a manual migration, so this
+        raises instead of letting later inserts fail obscurely. (Secondary
+        indexes are created by ``init_schema`` on every start, so existing
+        PostgreSQL databases pick up new ones; DuckDB uses none by design.)"""
+        added, blocked = [], []
         for t in ALL_TABLES.values():
             have = {
                 r["column_name"].lower()
@@ -110,10 +114,21 @@ class StorageAdapter(ABC):
                     "AND table_schema = current_schema()", {"t": t.name}
                 ).to_pylist()
             }
+            if not have:
+                continue  # table just created by init_schema
             for name, _, nullable in t.columns:
-                if name not in have and nullable:
-                    self.execute(f"ALTER TABLE {t.name} ADD COLUMN {t.column_sql(name, self.dialect)}")
-                    added.append(f"{t.name}.{name}")
+                if name in have:
+                    continue
+                if not nullable:
+                    blocked.append(f"{t.name}.{name}")
+                    continue
+                self.execute(f"ALTER TABLE {t.name} ADD COLUMN {t.column_sql(name, self.dialect)}")
+                added.append(f"{t.name}.{name}")
+        if blocked:
+            raise RuntimeError(
+                "database schema is missing NOT NULL column(s) that cannot be added automatically: "
+                + ", ".join(blocked) + ". Migrate these tables manually (add with a default, then backfill)."
+            )
         if added:
             logger.info("schema migrated: added {}", ", ".join(added))
         return added
