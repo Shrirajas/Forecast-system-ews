@@ -53,11 +53,18 @@ class CacheSettings(BaseModel):
 
 
 class ModelSettings(BaseModel):
-    #: ``stformer`` = in-repo spatial-temporal transformer (trainable, offline).
-    #: ``timesfm3`` = pretrained google/timesfm-3.0-pytorch (needs Hugging Face access).
+    #: ``stformer`` = in-repo spatial-temporal transformer (trainable, offline): the production engine.
+    #: ``timesfm3`` = pretrained google/timesfm-3.0-pytorch (needs Hugging Face access). Its weights are
+    #: licensed for non-commercial, non-production use only: research baseline, not for production.
     backend: Literal["stformer", "timesfm3"] = "stformer"
     checkpoint_path: Path = PROJECT_ROOT / "artifacts" / "models" / "ews_stformer.pt"
     timesfm_checkpoint: str = "google/timesfm-3.0-pytorch"
+    #: Series per TimesFM forward pass (the library's own default is 4).
+    timesfm_batch_size: int = 64
+    #: Run TimesFM under bf16/fp16 autocast on CUDA.
+    timesfm_autocast: bool = True
+    #: Required to load TimesFM 3.0 weights when environment == "prod" (licence acknowledgement).
+    allow_noncommercial_weights: bool = False
 
     context_length: int = 512  # 512 daily tokens ~= 18 months of EOD history
     max_horizon: int = 90
@@ -84,6 +91,7 @@ class ModelSettings(BaseModel):
     amp_dtype: Literal["auto", "bf16", "fp16", "fp32"] = "auto"
     cuda_memory_fraction: float = 0.92
     inference_batch_size: int = 512
+    #: torch.compile the network (CUDA only) for training and inference.
     compile_model: bool = False
 
     @field_validator("context_length")

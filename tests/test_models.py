@@ -148,14 +148,13 @@ def test_attrition_uses_pre_period_baseline_and_skips_stressed_accounts():
     assert stressed.attrition_alert.tolist() == [False, False, False]
 
 
-def test_timesfm3_adapter_with_tiny_random_model(tmp_path):
-    """Exercises the TimesFM 3.0 backend wiring (targets + past-only + past-future
-    covariates) with a tiny randomly initialised model, so no download is needed."""
+@pytest.fixture(scope="module")
+def tiny_timesfm(tmp_path_factory):
+    """A tiny randomly initialised TimesFM 3.0 model: exercises the real library API, no download."""
     tf = pytest.importorskip("timesfm3.torch.timesfm3_forecaster")
     from timesfm3.torch import configs
 
-    from models.engine import TimesFM3Engine
-
+    tmp = tmp_path_factory.mktemp("tfm")
     rb = configs.ResidualBlockConfig(hidden_dims=32, output_dims=32, use_bias=False, activation="relu")
     tc = configs.StackedTransformersConfig(
         num_layers=1,
@@ -165,14 +164,70 @@ def test_timesfm3_adapter_with_tiny_random_model(tmp_path):
             deterministic=True,
         ),
     )
-    cfg = tf._ModelConfig(checkpoint_path=str(tmp_path / "tiny.pt"), residual_block_config=rb,
+    cfg = tf._ModelConfig(checkpoint_path=str(tmp / "tiny.pt"), residual_block_config=rb,
                           transformer_config=tc, device="cpu")
-    torch.save(tf._make_torch_model(cfg).state_dict(), tmp_path / "tiny.pt")
-    forecaster = tf.TimesFM3Forecaster(cfg)
-    eng = TimesFM3Engine("unused", get_device_context(force_cpu=True), 512, 96, forecaster=forecaster)
-    past = np.random.default_rng(0).random((3, 512, 6)).astype(np.float32) * 1e4
-    past[0, :100] = np.nan
-    known = np.zeros((3, 608, 3), np.float32)
+    torch.manual_seed(0)
+    torch.save(tf._make_torch_model(cfg).state_dict(), tmp / "tiny.pt")
+    return tf.TimesFM3Forecaster(cfg)
+
+
+def _book(seed: int = 0):
+    rng = np.random.default_rng(seed)
+    past = rng.random((5, 512, 6)).astype(np.float32)
+    scale = np.array([1e2, 1e4, 1e6, 1e3, 1e5], dtype=np.float32)
+    past[..., 0] = past[..., 0] * scale[:, None] + scale[:, None]
+    past[[1, 3], :, 1] = 0.0  # CASA-only accounts: utilisation always zero
+    past[0, :400] = np.nan  # short histories
+    past[3, :200] = np.nan
+    return past, np.zeros((5, 608, 3), np.float32)
+
+
+def test_timesfm3_adapter_with_tiny_random_model(tiny_timesfm):
+    from models.engine import TimesFM3Engine
+
+    calls = []
+    real = tiny_timesfm.predict_batch
+
+    def spy(**kw):
+        calls.append(kw)
+        return real(**kw)
+
+    eng = TimesFM3Engine("unused", get_device_context(force_cpu=True), 512, 96, forecaster=tiny_timesfm, batch_size=16)
+    eng.model.predict_batch = spy
+    past, known = _book()
     q = eng.forecast(past, known, 60)
-    assert q.shape == (3, 2, 60, 9) and np.isfinite(q).all()
+    assert q.shape == (5, 2, 60, 9) and np.isfinite(q).all()
     assert (np.diff(q, axis=-1) >= 0).all()
+    assert eng.model.config.per_core_batch_size == 16
+    assert all(c["use_symmetric_averaging"] is False for c in calls)
+    n_targets = sorted(x.shape[0] for c in calls for x in c["contexts"])
+    assert n_targets == [1, 1, 2, 2, 2]  # the two CASA-only accounts forecast balance alone
+    assert np.all(q[[1, 3], 1] == 0.0)  # ...and get a zero utilisation track
+    lengths = sorted(c["contexts"][i].shape[1] for c in calls for i in range(len(c["contexts"])))
+    assert lengths == [112, 312, 512, 512, 512]  # leading NaNs stripped
+    for c in calls:  # one patch-rounded length per library call
+        assert len({-(-x.shape[1] // 32) for x in c["contexts"]}) == 1
+    # results come back in the caller's order despite grouping and sorting
+    med = q[:, 0, :, 4].mean(1)
+    assert list(np.argsort(med)) == [0, 3, 1, 4, 2]
+
+
+def test_timesfm3_chunking_matches_single_pass(tiny_timesfm):
+    from models.engine import TimesFM3Engine
+
+    ctx = get_device_context(force_cpu=True)
+    past, known = _book(1)
+    whole = TimesFM3Engine("u", ctx, 512, 96, forecaster=tiny_timesfm, chunk_size=512).forecast(past, known, 30)
+    chunked = TimesFM3Engine("u", ctx, 512, 96, forecaster=tiny_timesfm, chunk_size=2).forecast(past, known, 30)
+    np.testing.assert_allclose(chunked, whole, rtol=1e-3, atol=1e-3)
+
+
+def test_timesfm3_forecast_does_not_depend_on_batch_neighbours(tiny_timesfm):
+    from models.engine import TimesFM3Engine
+
+    eng = TimesFM3Engine("u", get_device_context(force_cpu=True), 512, 96, forecaster=tiny_timesfm)
+    past, known = _book(2)
+    together = eng.forecast(past, known, 30)
+    for i in range(len(past)):
+        alone = eng.forecast(past[i : i + 1], known[i : i + 1], 30)
+        np.testing.assert_allclose(alone[0], together[i], rtol=1e-4, atol=1e-3)
