@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EWS Console</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">EWS Console <span class="sub">Early warning &amp; loan loss</span></div>
+  <div class="conn" id="conn-badge">connecting…</div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="database">Database</button>
+  <button data-tab="import">Import data</button>
+  <button data-tab="jobs">Jobs <span id="jobs-badge" class="pill hidden"></span></button>
+  <button data-tab="alerts">Alerts</button>
+  <button data-tab="forecast">Account forecast</button>
+  <a class="docs" href="/docs" target="_blank" rel="noopener">API docs ↗</a>
+</nav>
+
+<main>
+  <!-- OVERVIEW -->
+  <section id="tab-overview" class="tab active">
+    <div id="next-step" class="callout hidden"></div>
+    <div class="grid4">
+      <div class="card"><h3>Database</h3><div id="ov-db" class="kv"></div></div>
+      <div class="card"><h3>Data</h3><div id="ov-data" class="kv"></div></div>
+      <div class="card"><h3>Model</h3><div id="ov-model" class="kv"></div></div>
+      <div class="card"><h3>Latest book run</h3><div id="ov-book" class="kv"></div></div>
+    </div>
+    <div class="card">
+      <h3>Tables</h3>
+      <div id="ov-tables" class="chips"></div>
+      <div class="actions">
+        <button class="primary" data-job="refresh">Refresh &amp; score book</button>
+        <button data-job="score-book">Score book only</button>
+        <button data-job="train">Train model</button>
+        <label class="inline">epochs <input id="train-epochs" type="number" min="1" max="200" value="6"></label>
+      </div>
+      <p class="hint">Jobs run in the background, one at a time. Training on a CPU takes a few minutes.</p>
+    </div>
+  </section>
+
+  <!-- DATABASE -->
+  <section id="tab-database" class="tab">
+    <div class="card">
+      <h3>Current database</h3>
+      <div id="db-current" class="kv"></div>
+    </div>
+    <div class="card">
+      <h3>Connect a database</h3>
+      <p class="hint">The EWS stores its tables, features and results here. Testing a connection creates the EWS
+        tables if they are missing; it never changes other tables.</p>
+      <div class="seg">
+        <label><input type="radio" name="backend" value="duckdb" checked> DuckDB file <span class="muted">(one machine, zero setup)</span></label>
+        <label><input type="radio" name="backend" value="postgres"> PostgreSQL <span class="muted">(shared, several API workers)</span></label>
+      </div>
+      <div id="db-duckdb" class="field">
+        <label for="duckdb-path">File path</label>
+        <input id="duckdb-path" placeholder="data/ews.duckdb or C:\data\bank_ews.duckdb">
+        <p class="hint">Relative paths are inside the project's <code>data/</code> folder. The file is created if missing.</p>
+      </div>
+      <div id="db-postgres" class="field hidden">
+        <label for="pg-dsn">Connection URL</label>
+        <input id="pg-dsn" placeholder="postgresql+psycopg2://user:password@localhost:5432/ews" autocomplete="off">
+        <p class="hint">Saved in <code>data/connection.json</code> on this machine (owner-only permissions) so the
+          server reconnects after a restart.</p>
+      </div>
+      <div class="actions">
+        <button id="db-test">Test connection</button>
+        <button id="db-use" class="primary">Use this database</button>
+      </div>
+      <div id="db-result"></div>
+    </div>
+  </section>
+
+  <!-- IMPORT -->
+  <section id="tab-import" class="tab">
+    <div class="card">
+      <h3>1 · Choose what you are importing</h3>
+      <div class="row">
+        <div class="field">
+          <label for="imp-table">Target table</label>
+          <select id="imp-table"></select>
+        </div>
+        <div class="field grow">
+          <p id="imp-table-help" class="hint"></p>
+          <p class="hint">Templates: <span id="imp-templates"></span></p>
+        </div>
+      </div>
+      <p class="hint">Minimum to get forecasts: <b>daily_balances</b>. For EMI-based SMA alerts also import
+        <b>accounts</b> and <b>loan_schedules</b>; <b>transactions</b> and <b>credit_profiles</b> add salary,
+        payment-return and bureau signals.</p>
+    </div>
+
+    <div class="card">
+      <h3>2 · Source</h3>
+      <div class="seg">
+        <label><input type="radio" name="src" value="file" checked> File (CSV or Parquet)</label>
+        <label><input type="radio" name="src" value="sql"> Query my database</label>
+      </div>
+      <div id="src-file">
+        <label class="drop" id="drop">
+          <input type="file" id="file-input" accept=".csv,.txt,.parquet,.pq" hidden>
+          <span>Drop a file here or <u>browse</u></span>
+          <span class="muted" id="file-name"></span>
+        </label>
+      </div>
+      <div id="src-sql" class="hidden">
+        <div class="field"><label for="sql-url">Source database URL</label>
+          <input id="sql-url" placeholder="postgresql+psycopg2://user:pass@host:5432/core  ·  sqlite:///C:/data/core.db" autocomplete="off"></div>
+        <div class="field"><label for="sql-query">SELECT query</label>
+          <textarea id="sql-query" rows="4" placeholder="SELECT acct_no, bal_date, closing_bal FROM eod_balances WHERE bal_date >= '2024-01-01'"></textarea></div>
+        <p class="hint">Read-only: one SELECT statement, streamed in batches. Drivers for PostgreSQL and SQLite are
+          installed; for MySQL or SQL Server install <code>pymysql</code> or <code>pyodbc</code>.</p>
+        <button id="sql-preview">Preview query</button>
+      </div>
+    </div>
+
+    <div class="card hidden" id="imp-preview-card">
+      <h3>3 · Preview</h3>
+      <div class="table-wrap"><table id="imp-preview"></table></div>
+    </div>
+
+    <div class="card hidden" id="imp-map-card">
+      <h3>4 · Map columns</h3>
+      <p class="hint">Matched automatically where the names are recognisable. Unmapped required columns use the
+        constant or the default shown.</p>
+      <div class="table-wrap"><table id="imp-map" class="map"></table></div>
+      <div class="row">
+        <div class="field">
+          <label for="date-fmt">Date format in the source</label>
+          <select id="date-fmt">
+            <option value="">ISO (2024-12-31)</option>
+            <option value="%d/%m/%Y">31/12/2024</option>
+            <option value="%m/%d/%Y">12/31/2024</option>
+            <option value="%d-%m-%Y">31-12-2024</option>
+            <option value="%d.%m.%Y">31.12.2024</option>
+            <option value="%Y%m%d">20241231</option>
+            <option value="%d-%b-%Y">31-Dec-2024</option>
+          </select>
+        </div>
+        <label class="inline"><input type="checkbox" id="signed" checked> Negative amounts are debits</label>
+        <label class="inline"><input type="checkbox" id="dec-comma"> Decimal comma (1.234,56)</label>
+        <label class="inline"><input type="checkbox" id="refresh-after" checked> Refresh &amp; score afterwards</label>
+      </div>
+      <div class="actions"><button id="imp-go" class="primary">Import</button></div>
+      <div id="imp-result"></div>
+    </div>
+  </section>
+
+  <!-- JOBS -->
+  <section id="tab-jobs" class="tab">
+    <div class="card">
+      <h3>Background jobs</h3>
+      <div class="table-wrap"><table id="jobs-table"></table></div>
+    </div>
+  </section>
+
+  <!-- ALERTS -->
+  <section id="tab-alerts" class="tab">
+    <div class="card">
+      <div class="row">
+        <h3 class="grow">Active alerts</h3>
+        <select id="al-type"><option value="">All types</option><option>CREDIT_EWS</option><option>DEPOSIT_ATTRITION</option></select>
+        <select id="al-tier"><option value="">All tiers</option><option>SMA-0</option><option>SMA-1</option><option>SMA-2</option></select>
+        <button id="al-reload">Reload</button>
+      </div>
+      <div class="table-wrap"><table id="alerts-table"></table></div>
+      <p class="hint">Click an account to see its forecast.</p>
+    </div>
+  </section>
+
+  <!-- FORECAST -->
+  <section id="tab-forecast" class="tab">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label for="fc-account">Account id</label><input id="fc-account" placeholder="AC00000018"></div>
+        <div class="field"><label for="fc-h">Horizon</label>
+          <select id="fc-h"><option>30</option><option>60</option><option selected>90</option></select></div>
+        <div class="actions end"><button id="fc-go" class="primary">Forecast</button></div>
+      </div>
+      <div id="fc-summary" class="grid4"></div>
+      <div id="fc-chart" class="chart"></div>
+      <div id="fc-triggers" class="chips"></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="console.js"></script>
+</body>
+</html>

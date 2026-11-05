@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from fastapi import Request
 
 from api.broker import AlertBroker
+from api.jobs import JobManager
 from config.settings import Settings
 from data_engine.ingestion import IngestionEngine
 from models.pipeline import EWSPipeline
@@ -18,6 +19,7 @@ class Services:
     pipeline: EWSPipeline
     ingestion: IngestionEngine
     broker: AlertBroker
+    jobs: JobManager
 
 
 def services(request: Request) -> Services:

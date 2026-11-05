@@ -11,19 +11,26 @@ on a worker thread, so the event loop only handles HTTP and SSE.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import anyio
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
+from api import connection
 from api.broker import AlertBroker
 from api.deps import Services
-from api.routes import alerts, ingest, predict, system
+from api.jobs import JobManager
+from api.routes import alerts, console, ingest, predict, system
 from config.settings import Settings, get_settings
 from data_engine.ingestion import IngestionEngine
 from data_engine.storage import get_storage
 from models.pipeline import EWSPipeline
 from utils.logging import logger, setup_logging
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _warm(pipeline: EWSPipeline) -> None:
@@ -42,7 +49,7 @@ def _warm(pipeline: EWSPipeline) -> None:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
+    settings = connection.load_saved(settings or get_settings())
     setup_logging(settings.log_level)
 
     @asynccontextmanager
@@ -56,6 +63,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pipeline=pipeline,
             ingestion=IngestionEngine(storage, batch_rows=settings.storage.stream_batch_rows),
             broker=AlertBroker(),
+            jobs=JobManager(),
         )
         if settings.warm_cache_on_startup:
             await run_in_threadpool(_warm, pipeline)
@@ -72,8 +80,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
-    for r in (system.router, ingest.router, predict.router, alerts.router):
+    for r in (system.router, ingest.router, predict.router, alerts.router, console.router):
         app.include_router(r)
+    # Web console: connect a database, import data, run jobs, browse alerts and forecasts.
+    app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
     return app
 
 

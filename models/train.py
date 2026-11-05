@@ -39,6 +39,11 @@ class TrainResult:
     device: str
 
 
+def cpu_profile(m: ModelSettings) -> ModelSettings:
+    """Smaller network and fewer windows so CPU-only training takes minutes."""
+    return m.model_copy(update=dict(d_model=96, n_layers=2, ff_mult=2, n_heads=4, window_stride=5, num_workers=0))
+
+
 def config_from_settings(m: ModelSettings) -> STFormerConfig:
     return STFormerConfig(
         context_length=m.context_length,

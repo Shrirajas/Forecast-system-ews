@@ -31,15 +31,10 @@ from data_engine.storage import get_storage
 from data_engine.synth import SandboxConfig, generate_sandbox
 from models.backtest import backtest
 from models.pipeline import EWSPipeline, ScoreRequest
-from models.train import train_model
+from models.train import cpu_profile, train_model
 from utils.logging import logger, setup_logging
 
 LOAD_ORDER = ("holidays", "accounts", "loan_schedules", "credit_profiles", "daily_balances", "transactions")
-
-
-def cpu_profile(m):
-    """Smaller network and fewer windows so CPU-only training takes minutes."""
-    return m.model_copy(update=dict(d_model=96, n_layers=2, ff_mult=2, n_heads=4, window_stride=5, num_workers=0))
 
 
 def main() -> None:

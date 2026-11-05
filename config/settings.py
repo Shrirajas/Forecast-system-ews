@@ -163,6 +163,12 @@ class Settings(BaseSettings):
     book_alert_horizon: int = 90
     #: Stored book runs kept per horizon; older runs' per-account scores are deleted.
     keep_book_runs: int = 3
+    #: The web console's admin endpoints (switch database, import, train) answer only
+    #: requests from this machine unless this is true. Put real auth in front first.
+    admin_allow_remote: bool = False
+    #: Reuse the database chosen in the console (data/connection.json) on restart,
+    #: unless EWS_STORAGE__* environment variables are set.
+    use_saved_connection: bool = True
 
     storage: StorageSettings = Field(default_factory=StorageSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
