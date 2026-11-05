@@ -63,6 +63,13 @@ class CacheWindowDataset(Dataset):
         return torch.from_numpy(past), torch.from_numpy(known), torch.from_numpy(future)
 
 
+def holdout_split(n_accounts: int, val_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """(validation rows, training rows) of the account-level holdout."""
+    perm = np.random.default_rng(seed).permutation(n_accounts)
+    n_val = int(round(n_accounts * val_fraction)) if n_accounts > 1 else 0
+    return perm[:n_val], perm[n_val:]
+
+
 def build_window_index(
     n_accounts: int,
     n_days: int,
@@ -71,16 +78,21 @@ def build_window_index(
     val_fraction: float,
     seed: int,
     min_context: int | None = None,
+    max_target_day: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Account-level holdout: validation accounts are never seen in training."""
+    """Account-level holdout: validation accounts are never seen in training.
+
+    ``max_target_day`` (inclusive day index) drops every window whose
+    supervised horizon would reach past it, for strictly out-of-time
+    evaluation after that day."""
     min_ctx = min_context or spec.context // 2
-    cuts = np.arange(min_ctx, n_days - spec.horizon + 1, stride)
+    last_cut = n_days - spec.horizon
+    if max_target_day is not None:
+        last_cut = min(last_cut, max_target_day - spec.horizon + 1)
+    cuts = np.arange(min_ctx, last_cut + 1, stride)
     if cuts.size == 0:
         raise ValueError(f"need at least {min_ctx + spec.horizon} days of history to train, have {n_days}")
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_accounts)
-    n_val = int(round(n_accounts * val_fraction)) if n_accounts > 1 else 0
-    val_rows, train_rows = perm[:n_val], perm[n_val:]
+    val_rows, train_rows = holdout_split(n_accounts, val_fraction, seed)
 
     def grid(rows: np.ndarray, cut_set: np.ndarray) -> np.ndarray:
         if rows.size == 0:

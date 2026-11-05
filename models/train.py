@@ -22,6 +22,8 @@ from models.stformer import EWSForecaster, STFormerConfig
 from utils.device import DeviceContext, get_device_context
 from utils.logging import logger
 
+MAX_VAL_WINDOWS = 8_192
+
 
 @dataclass
 class TrainResult:
@@ -82,7 +84,14 @@ def train_model(
     checkpoint_path: Path | None = None,
     max_steps_per_epoch: int | None = None,
     quiet: bool = False,
+    max_target_day: int | None = None,
+    init_checkpoint: Path | None = None,
 ) -> TrainResult:
+    """Train on the cache at ``cache_dir``.
+
+    ``max_target_day`` keeps every supervised target on or before that day
+    index (out-of-time evaluation); ``init_checkpoint`` warm-starts from a
+    compatible checkpoint (transfer learning / fine-tuning)."""
     t0 = time.perf_counter()
     torch.manual_seed(m.seed)
     np.random.seed(m.seed)
@@ -92,14 +101,37 @@ def train_model(
 
     past_shape = np.load(cache_dir / "past.npy", mmap_mode="r").shape
     train_idx, val_idx = build_window_index(
-        past_shape[0], past_shape[1], spec, m.window_stride, m.val_fraction, m.seed
+        past_shape[0], past_shape[1], spec, m.window_stride, m.val_fraction, m.seed,
+        max_target_day=max_target_day,
     )
+    # Drop windows whose account is not yet open at the cutoff or has no target.
+    past_mm = np.load(cache_dir / "past.npy", mmap_mode="r")
+
+    def observed(idx: np.ndarray) -> np.ndarray:
+        if len(idx) == 0:
+            return idx
+        last_ctx = past_mm[idx[:, 0], idx[:, 1] - 1, 0]
+        first_tgt = past_mm[idx[:, 0], np.minimum(idx[:, 1], past_shape[1] - 1), 0]
+        return idx[~np.isnan(last_ctx) & ~np.isnan(first_tgt)]
+
+    train_idx, val_idx = observed(train_idx), observed(val_idx)
+    if len(val_idx) > MAX_VAL_WINDOWS:  # keep per-epoch validation cheap on large books
+        keep = np.random.default_rng(m.seed).choice(len(val_idx), MAX_VAL_WINDOWS, replace=False)
+        val_idx = val_idx[np.sort(keep)]
     train_ds = CacheWindowDataset(cache_dir, train_idx, spec)
     val_ds = CacheWindowDataset(cache_dir, val_idx, spec)
     train_dl = make_loader(train_ds, m.batch_size, True, ctx, m.num_workers)
     val_dl = make_loader(val_ds, m.batch_size * 2, False, ctx, m.num_workers) if len(val_ds) else None
 
-    model = EWSForecaster(cfg).to(ctx.device)
+    model = EWSForecaster(cfg)
+    if init_checkpoint is not None:
+        blob = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+        if blob["config"] != cfg.to_dict():
+            raise ValueError("init_checkpoint architecture differs from the training configuration")
+        model.load_state_dict(blob["state_dict"])
+        log_ = logger.debug if quiet else logger.info
+        log_("warm start from {}", init_checkpoint)
+    model = model.to(ctx.device)
     if m.compile_model and ctx.is_cuda:
         # compile the inner network's forward only: state_dict keys stay unchanged
         model.net.forward = torch.compile(model.net.forward)

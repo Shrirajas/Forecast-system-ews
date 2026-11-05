@@ -56,11 +56,11 @@ curl -N 'localhost:8000/api/v1/alerts/active?stream=true&follow=true'   # Server
 | Path | Contents |
 |---|---|
 | `config/` | `settings.py`: pydantic-settings; every value overridable via `EWS_*` env vars |
-| `data_engine/` | `schema.py` (DDL + Arrow schemas), `storage.py` (DuckDB / Postgres adapters), `ingestion.py` (streaming loads), `aggregation.py` (incremental feature matrix), `vector_cache.py` (memmap tensors), `calendar.py` (RBI business-day rules), `synth.py` (sandbox generator), `alerts.py` (run/alert persistence) |
+| `data_engine/` | `schema.py` (DDL + Arrow schemas), `storage.py` (DuckDB / Postgres adapters), `adapters/berka.py` (public Czech bank dataset), `ingestion.py` (streaming loads), `aggregation.py` (incremental feature matrix), `vector_cache.py` (memmap tensors), `calendar.py` (RBI business-day rules), `synth.py` (sandbox generator), `alerts.py` (run/alert persistence) |
 | `models/` | `stformer.py` (network), `dataset.py`, `train.py`, `engine.py` (stformer / TimesFM 3 backends), `risk.py`, `behavior.py`, `pipeline.py` (end-to-end scoring), `backtest.py`, `tuning.py` (Optuna), `distributed.py` (Ray) |
 | `api/` | `main.py` (app + lifespan), `schemas.py` (Pydantic contracts), `routes/` |
 | `utils/` | `device.py` (CUDA/AMP/OOM handling), `streaming.py`, `logging.py` |
-| `scripts/` | `bootstrap.py`, `generate_sandbox.py`, `train.py`, `serve.py`, `backtest.py`, `tune.py`, `batch_score_ray.py` |
+| `scripts/` | `bootstrap.py`, `generate_sandbox.py`, `train.py`, `serve.py`, `backtest.py`, `berka_benchmark.py`, `tune.py`, `batch_score_ray.py` |
 | `tests/` | pytest suite (data engine, model, risk maths, API contracts) |
 
 ## Data layer
@@ -177,6 +177,67 @@ returns, PD ROC-AUC and Brier score, breach-timing error, and attrition
 precision and recall against realised balance outflows. A higher liability
 trigger quantile (q20/q30) trades a little recall for much higher precision.
 
+## Real-data benchmark: Berka / PKDD'99 Czech bank
+
+`scripts/berka_benchmark.py` runs the whole stack on the public PKDD'99
+"financial" dataset: real, anonymised data from a Czech bank, 1993–1998,
+with 4,500 accounts, 1.06M transactions and 682 loans with outcomes.
+`data_engine/adapters/berka.py` maps it into the ingestion schema. The
+end-of-day balance is the bank's reported balance after the day's last
+transaction (5.59M account-days). Loan payments become EMIs, and pension
+and inbound transfers become income.
+
+```bash
+git clone --depth 1 https://github.com/jlacko/berka-dataset ../berka-dataset
+python scripts/berka_benchmark.py --raw ../berka-dataset      # ~5 min on a 4-core CPU; writes data/berka/report.json
+```
+
+The book is scored as of 1998-10-02 and compared with the following 90
+days of real data. The fine-tuned model only saw training targets dated on
+or before 1998-10-02. "Holdout" accounts (15 %) were never trained on.
+
+| 90-day balance forecast (4,500 accounts) | wQL ↓ | WAPE (median) ↓ | q10–q90 coverage (target 0.80) |
+|---|---|---|---|
+| Persistence (last balance) | 0.212 | 0.212 | 0.06 |
+| Seasonal naive (30 days) | 0.196 | 0.196 | 0.00 |
+| Per-account empirical quantiles (180 days) | 0.179 | 0.225 | 0.57 |
+| STFormer trained on the synthetic sandbox only (zero-shot) | 0.184 | 0.224 | 0.76 |
+| **STFormer fine-tuned on Berka, out-of-time** | **0.136** | **0.174** | **0.81** |
+| …same, holdout accounts only | 0.141 | 0.181 | 0.81 |
+
+| Early warning, 437 loans with an instalment due (62 bad outcomes) | Flagged | Precision | Recall | ROC-AUC |
+|---|---|---|---|---|
+| Fine-tuned model, SMA flag / PD vs any bad outcome¹ | 25 | 0.68 | 0.27 | **0.80** |
+| …vs the bank's own "in debt / not paid" status | 25 | 0.64 | 0.35 | **0.87** |
+| …vs a negative balance in the next 90 days | 25 | 0.40 | 0.83 | **0.97** |
+| Rule: balance below next instalment today | 10 | 1.00 | 0.16 | 0.61 |
+| Rule: negative balance in the last 90 days | 11 | 1.00 | 0.18 | 0.67 |
+| Zero-shot sandbox model vs any bad outcome | 104 | 0.23 | 0.39 | 0.68 |
+
+¹ Bad outcome = a scheduled loan payment that never arrived, a negative
+balance in the window, or loan status B/D at the end of the data.
+
+What this shows:
+
+* Fine-tuned on real ledgers, the forecaster beats every naive baseline,
+  with 24 % lower quantile loss than the best one, and its q10–q90 bands
+  are calibrated (81 % coverage).
+* As a risk ranker it beats simple rules on bad outcomes and on the
+  bank's status (AUC 0.80–0.87 against 0.61–0.73). On predicting negative
+  balances it matches the best rule (0.97 against 0.96).
+* The default q10 trigger is conservative: high precision, low recall. Use
+  a higher liability quantile, or rank by PD, for wider coverage.
+* The model trained only on synthetic data does not transfer. Fine-tune on
+  your own history before relying on it.
+
+Caveats:
+
+* Berka has no bureau scores or credit-line data, so those PD components
+  are inactive.
+* The loan status is a single end-of-1998 snapshot.
+* Missed payments are inferred by comparing the reconstructed schedule with
+  the loan-payment transactions (±3 days).
+
 ## API
 
 | Method & path | Purpose |
@@ -206,7 +267,7 @@ Interactive docs: `/docs`.
 ## Tests
 
 ```bash
-pytest -q                                                    # 30 tests: data engine, model, risk maths, API, TimesFM 3 adapter
+pytest -q                                                    # 32 tests: data engine, model, risk maths, API, TimesFM 3 adapter
 EWS_TEST_POSTGRES_DSN=postgresql+psycopg2://user@host/db pytest tests/test_postgres.py   # Postgres parity (drops EWS tables!)
 ```
 
