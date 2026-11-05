@@ -97,6 +97,27 @@ class StorageAdapter(ABC):
             return None
         return tbl.column(0)[0].as_py()
 
+    def migrate(self) -> list[str]:
+        """Add columns that newer releases declare but an existing database lacks.
+
+        Only nullable columns are ever added, so this is safe on live tables."""
+        added = []
+        for t in ALL_TABLES.values():
+            have = {
+                r["column_name"].lower()
+                for r in self.query_arrow(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = :t "
+                    "AND table_schema = current_schema()", {"t": t.name}
+                ).to_pylist()
+            }
+            for name, _, nullable in t.columns:
+                if name not in have and nullable:
+                    self.execute(f"ALTER TABLE {t.name} ADD COLUMN {t.column_sql(name, self.dialect)}")
+                    added.append(f"{t.name}.{name}")
+        if added:
+            logger.info("schema migrated: added {}", ", ".join(added))
+        return added
+
     def write_rows(self, table: str, rows: list[dict[str, Any]], mode: WriteMode = "upsert") -> int:
         if not rows:
             return 0
@@ -341,6 +362,7 @@ def get_storage(settings: Settings | None = None) -> StorageAdapter:
         if adapter is None:
             adapter = DuckDBStorage(s) if s.storage.backend == "duckdb" else PostgresStorage(s)
             adapter.init_schema()
+            adapter.migrate()
             _ADAPTERS[(s.storage.backend, key)] = adapter
             logger.info("Storage ready: {} ({})", s.storage.backend, key)
         return adapter

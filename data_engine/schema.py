@@ -39,6 +39,11 @@ class Table:
             [pa.field(n, _TYPES[t][2], nullable=nullable) for n, t, nullable in self.columns]
         )
 
+    def column_sql(self, name: str, dialect: str) -> str:
+        idx = 0 if dialect == "duckdb" else 1
+        n, t, nullable = next(c for c in self.columns if c[0] == name)
+        return f"{n} {_TYPES[t][idx]}{'' if nullable else ' NOT NULL'}"
+
     def ddl(self, dialect: str) -> list[str]:
         idx = 0 if dialect == "duckdb" else 1
         cols = ",\n  ".join(
@@ -170,8 +175,57 @@ FORECAST_RUNS = Table(
         ("n_alerts", "i32", False),
         ("total_expected_loss", "f64", False),
         ("params", "str", True),
+        ("scope", "str", True),  # BOOK (whole portfolio) / ACCOUNTS
+        ("cache_version", "str", True),  # data version the run scored
+        ("liability_quantile", "f64", True),
+        ("asset_quantile", "f64", True),
     ),
     ("run_id",),
+    (("scope", "cache_version"),),
+)
+
+#: One row per account per run: everything /predict/ews returns except paths,
+#: so whole-book reads come straight from the latest matching run.
+ACCOUNT_SCORES = Table(
+    "account_scores",
+    (
+        ("run_id", "str", False),
+        ("account_id", "str", False),
+        ("rm_id", "str", True),
+        ("segment", "str", True),
+        ("product_type", "str", True),
+        ("as_of_date", "date", False),
+        ("horizon", "i32", False),
+        ("risk_tier", "str", False),
+        ("days_to_breach", "i32", True),
+        ("breach_date", "date", True),
+        ("breach_shortfall", "f64", True),
+        ("days_to_zero", "i32", True),
+        ("current_balance", "f64", True),
+        ("current_utilization", "f64", True),
+        ("next_emi_date", "date", True),
+        ("next_emi_amount", "f64", True),
+        ("probability_of_default", "f64", True),
+        ("pd_cash_shortfall", "f64", True),
+        ("pd_utilization_breach", "f64", True),
+        ("pd_bureau", "f64", True),
+        ("exposure_at_default", "f64", True),
+        ("loss_given_default", "f64", True),
+        ("expected_loss", "f64", True),
+        ("priority_score", "f64", True),
+        ("cibil_score", "f64", True),
+        ("triggers", "str", True),
+        ("trailing_avg_balance_90d", "f64", True),
+        ("baseline_avg_balance", "f64", True),
+        ("projected_avg_balance", "f64", True),
+        ("projected_change_pct", "f64", True),
+        ("projected_min_balance_worst_case", "f64", True),
+        ("trend", "str", True),
+        ("attrition_alert", "i16", True),
+        ("projected_balance_drop", "f64", True),
+        ("cof_impact_annual", "f64", True),
+    ),
+    ("run_id", "account_id"),
 )
 
 RUN_SCOPE = Table("run_scope", (("run_id", "str", False), ("account_id", "str", False)), ("run_id", "account_id"))
@@ -219,6 +273,7 @@ ALL_TABLES: dict[str, Table] = {
         FEATURE_MATRIX,
         AGG_WATERMARKS,
         FORECAST_RUNS,
+        ACCOUNT_SCORES,
         RUN_SCOPE,
         EWS_ALERTS,
     )

@@ -3,13 +3,16 @@
 ``stformer``  the in-repo spatial-temporal transformer trained on your own ledgers.
 ``timesfm3``  Google's pretrained TimesFM 3.0 (``google/timesfm-3.0-pytorch``),
               zero-shot, multivariate with past-only and past-and-future
-              covariates. Needs Hugging Face access on first load.
+              covariates. Needs Hugging Face access on first load. Weights are
+              non-commercial: a research baseline, not a production engine.
 
 Both return raw-unit quantiles ``[B, 2, horizon, 9]`` (balance, utilisation).
 """
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -39,7 +42,7 @@ class ForecastEngine(ABC):
 class STFormerEngine(ForecastEngine):
     name = "stformer"
 
-    def __init__(self, checkpoint: Path, ctx: DeviceContext, batch_size: int = 512):
+    def __init__(self, checkpoint: Path, ctx: DeviceContext, batch_size: int = 512, compile_model: bool = False):
         if not Path(checkpoint).exists():
             raise FileNotFoundError(
                 f"model checkpoint not found at {checkpoint}; run `python scripts/bootstrap.py` "
@@ -50,6 +53,9 @@ class STFormerEngine(ForecastEngine):
         self.model = EWSForecaster(self.cfg)
         self.model.load_state_dict(blob["state_dict"])
         self.model.to(ctx.device).eval()
+        if compile_model and ctx.is_cuda:
+            # Batch sizes vary per request, so compile with dynamic shapes to avoid recompiles.
+            self.model.net.forward = torch.compile(self.model.net.forward, dynamic=True)
         self.ctx = ctx
         self.batch_size = batch_size
         self.context_length = self.cfg.context_length
@@ -80,45 +86,108 @@ class STFormerEngine(ForecastEngine):
 
 
 class TimesFM3Engine(ForecastEngine):
+    """Pretrained TimesFM 3.0, zero-shot.
+
+    * Balance and utilisation are multivariate targets, the four behavioural
+      features are past-only covariates, and the EMI / holiday / payroll
+      calendars are past-and-future covariates.
+    * Accounts whose utilisation history is all zero (no credit line, e.g. CASA
+      only) are forecast with balance as the only target; their utilisation
+      track is 0.
+    * Each account's context starts at its first observed day. Accounts are
+      batched by patch-rounded history length: the library pads a batch to its
+      longest series and padding changes the forecast, so this keeps padding
+      minimal and makes results independent of batch composition.
+    * Work is chunked with OOM backoff, runs under autocast on CUDA, and never
+      uses symmetric averaging (which would double the forward passes).
+
+    Licence: the TimesFM 3.0 weights are for non-commercial, non-production
+    use. Use this engine as a research baseline only.
+    """
+
     name = "timesfm3"
 
     def __init__(
-        self, checkpoint: str, ctx: DeviceContext, context_length: int, horizon_pad: int, forecaster=None
+        self,
+        checkpoint: str,
+        ctx: DeviceContext,
+        context_length: int,
+        horizon_pad: int,
+        forecaster=None,
+        batch_size: int = 64,
+        chunk_size: int = 512,
+        autocast: bool = True,
     ):
         if forecaster is None:
             try:
                 from timesfm3 import TimesFM3Forecaster
             except ImportError as exc:  # pragma: no cover - optional dependency
                 raise RuntimeError("timesfm3 backend needs `pip install 'timesfm[torch]>=3.0'`") from exc
-            forecaster = TimesFM3Forecaster.from_pretrained(checkpoint, device=str(ctx.device))
+            forecaster = TimesFM3Forecaster.from_pretrained(
+                checkpoint, device=str(ctx.device), per_core_batch_size=batch_size
+            )
+        else:
+            forecaster.config = dataclasses.replace(forecaster.config, per_core_batch_size=batch_size)
         self.model = forecaster
         self.ctx = ctx
         self.context_length = context_length
         self.horizon_pad = horizon_pad
+        self.chunk_size = chunk_size
+        self.use_autocast = autocast
         self.model_quantiles = np.asarray(self.model.config.quantiles, dtype=np.float64)
         self._lock = threading.Lock()
 
-    def forecast(self, past: np.ndarray, known: np.ndarray, horizon: int) -> np.ndarray:
-        L = past.shape[1]
-        contexts = [past[i, :, :2].T.astype(np.float32) for i in range(len(past))]
-        past_only = [past[i, :, 2:].T.astype(np.float32) for i in range(len(past))]
-        past_future = [known[i, : L + horizon].T.astype(np.float32) for i in range(len(past))]
-        with self._lock, torch.inference_mode():
-            outs = list(
-                self.model.predict_batch(
-                    contexts=contexts,
-                    horizon=horizon,
-                    past_only_covariates=past_only,
-                    past_future_covariates=past_future,
-                    return_quantiles=True,
-                )
-            )
-        q = np.stack([o.quantiles for o in outs]).astype(np.float32)  # [B, 2, H, Qm]
+    def _to_ours(self, q: np.ndarray) -> np.ndarray:
         if q.shape[-1] == len(self.model_quantiles) + 1:  # some checkpoints prepend the mean
             q = q[..., 1:]
         if len(self.model_quantiles) != len(QUANTILES) or not np.allclose(self.model_quantiles, QUANTILES):
             q = np.apply_along_axis(lambda v: np.interp(QUANTILES, self.model_quantiles, v), -1, q)
         return np.sort(q, axis=-1).astype(np.float32)
+
+    def _predict(self, past, known, start, rows: np.ndarray, n_targets: int, horizon: int) -> np.ndarray:
+        L = past.shape[1]
+
+        def run(a: int, b: int) -> np.ndarray:
+            sel = rows[a:b]
+            ctx_ = [past[i, start[i] :, :n_targets].T.astype(np.float32) for i in sel]
+            po = [past[i, start[i] :, 2:].T.astype(np.float32) for i in sel]
+            pf = [known[i, start[i] : L + horizon].T.astype(np.float32) for i in sel]
+            amp = self.ctx.autocast() if self.use_autocast else contextlib.nullcontext()
+            with torch.inference_mode(), amp:
+                outs = list(
+                    self.model.predict_batch(
+                        contexts=ctx_,
+                        horizon=horizon,
+                        past_only_covariates=po,
+                        past_future_covariates=pf,
+                        return_quantiles=True,
+                        use_symmetric_averaging=False,
+                    )
+                )
+            return np.stack([o.quantiles for o in outs]).astype(np.float32)  # [n, n_targets, H, Qm]
+
+        return np.concatenate(list(run_with_oom_backoff(run, len(rows), self.chunk_size)), axis=0)
+
+    def forecast(self, past: np.ndarray, known: np.ndarray, horizon: int) -> np.ndarray:
+        b, L = past.shape[:2]
+        out = np.zeros((b, 2, horizon, len(QUANTILES)), dtype=np.float32)
+        if b == 0:
+            return out
+        observed = ~np.isnan(past[:, :, 0])
+        start = np.where(observed.any(1), observed.argmax(1), L - 1)
+        has_util = np.nan_to_num(np.abs(past[:, :, 1])).max(1) > 0
+        patch = int(getattr(self.model.config, "input_patch_length", 32))
+        bucket = -(-(L - start) // patch)  # history length in patches
+        with self._lock:
+            for util_flag, n_targets in ((True, 2), (False, 1)):
+                for nb in np.unique(bucket[has_util == util_flag]):
+                    # The library pads each batch to its longest series and padding shifts
+                    # the forecast; equal patch-rounded lengths make every account's result
+                    # independent of which accounts share its batch.
+                    rows = np.flatnonzero((has_util == util_flag) & (bucket == nb))
+                    q = self._to_ours(self._predict(past, known, start, rows, n_targets, horizon))
+                    out[rows, :n_targets] = q
+        return out
 
 
 _engine: ForecastEngine | None = None
@@ -132,10 +201,21 @@ def get_engine(settings: Settings, reload: bool = False) -> ForecastEngine:
             m = settings.model
             ctx = get_device_context(m.amp_dtype, m.cuda_memory_fraction)
             if m.backend == "timesfm3":
+                if settings.environment == "prod" and not m.allow_noncommercial_weights:
+                    raise RuntimeError(
+                        "TimesFM 3.0 weights are licensed for non-commercial, non-production use; "
+                        "use the stformer backend in production (or set "
+                        "EWS_MODEL__ALLOW_NONCOMMERCIAL_WEIGHTS=true for a licensed research setup)"
+                    )
+                logger.warning("TimesFM 3.0 weights: non-commercial licence, research use only")
                 hp = -(-m.max_horizon // m.patch_length) * m.patch_length
-                _engine = TimesFM3Engine(m.timesfm_checkpoint, ctx, m.context_length, hp)
+                _engine = TimesFM3Engine(
+                    m.timesfm_checkpoint, ctx, m.context_length, hp,
+                    batch_size=m.timesfm_batch_size, chunk_size=m.inference_batch_size,
+                    autocast=m.timesfm_autocast,
+                )
             else:
-                _engine = STFormerEngine(m.checkpoint_path, ctx, m.inference_batch_size)
+                _engine = STFormerEngine(m.checkpoint_path, ctx, m.inference_batch_size, m.compile_model)
             logger.info("forecast engine loaded: {}", _engine.name)
         return _engine
 
