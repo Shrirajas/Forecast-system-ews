@@ -82,7 +82,7 @@ def main() -> None:
         result = train_model(cache_dir, m)
         logger.info("model trained: {}", result)
 
-    out = pipeline.score(ScoreRequest(horizon=90, include_paths=False))
+    out = pipeline.score(ScoreRequest(horizon=90, paths="none", use_stored=False))
     print(json.dumps(out["summary"], indent=2))
     top, total = pipeline.alerts.active(limit=10)
     print(f"\nTop alerts ({total} active):")

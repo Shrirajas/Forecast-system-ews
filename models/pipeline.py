@@ -41,9 +41,14 @@ class ScoreRequest:
     liability_quantile: float = 0.1
     asset_quantile: float = 0.9
     return_quantiles: list[float] = field(default_factory=lambda: [0.1, 0.5, 0.9])
-    include_paths: bool = True
+    #: Forecast paths to return: "none", "flagged" (non-GREEN accounts only) or "all".
+    paths: str = "all"
     persist_alerts: bool = True
-    auto_refresh: bool = True
+    #: Refresh features/cache inside the call when data moved. Off on the API path:
+    #: refreshes run after ingest and in the nightly job, never inside a request.
+    auto_refresh: bool = False
+    #: Serve whole-book requests from the latest stored book run when it matches.
+    use_stored: bool = True
 
 
 @dataclass
@@ -61,15 +66,35 @@ class ScoredBatch:
     behavior: BehaviorResult
 
 
-def _f(x: Any, nd: int = 2) -> float | None:
-    if x is None:
-        return None
-    x = float(x)
-    return None if not np.isfinite(x) else round(x, nd)
-
-
 def _s(x: Any) -> str | None:
     return None if x is None or (isinstance(x, float) and np.isnan(x)) else str(x)
+
+
+def _nest(r: dict[str, Any]) -> dict[str, Any]:
+    """One flat account_scores row -> the /predict/ews account shape."""
+    return {
+        "account_id": r["account_id"], "rm_id": r["rm_id"], "segment": r["segment"],
+        "product_type": r["product_type"], "risk_tier": r["risk_tier"],
+        "days_to_breach": r["days_to_breach"], "breach_date": r["breach_date"],
+        "breach_shortfall": r["breach_shortfall"], "days_to_zero": r["days_to_zero"],
+        "current_balance": r["current_balance"], "current_utilization": r["current_utilization"],
+        "next_emi": {"date": r["next_emi_date"], "amount": r["next_emi_amount"]} if r["next_emi_date"] else None,
+        "probability_of_default": r["probability_of_default"],
+        "pd_components": {"cash_shortfall": r["pd_cash_shortfall"],
+                          "utilization_breach": r["pd_utilization_breach"], "bureau": r["pd_bureau"]},
+        "exposure_at_default": r["exposure_at_default"], "loss_given_default": r["loss_given_default"],
+        "expected_loss": r["expected_loss"], "priority_score": r["priority_score"], "cibil_score": r["cibil_score"],
+        "triggers": json.loads(r["triggers"] or "[]"),
+        "behavior": {
+            "trailing_avg_balance_90d": r["trailing_avg_balance_90d"],
+            "baseline_avg_balance": r["baseline_avg_balance"],
+            "projected_avg_balance": r["projected_avg_balance"],
+            "projected_change_pct": r["projected_change_pct"],
+            "projected_min_balance_worst_case": r["projected_min_balance_worst_case"],
+            "trend": r["trend"], "attrition_alert": bool(r["attrition_alert"]),
+            "projected_balance_drop": r["projected_balance_drop"], "cof_impact_annual": r["cof_impact_annual"],
+        },
+    }
 
 
 def _day(x: int) -> int | None:
@@ -114,6 +139,13 @@ class EWSPipeline:
                 "cache_version": rebuilt.version if rebuilt else self.cache.load().meta.version,
                 "cache_rebuilt": rebuilt is not None,
             }
+
+    def refresh_and_rescore(self) -> dict[str, Any]:
+        """Write path, run after ingest and nightly: refresh, then store a fresh book run."""
+        out = self.refresh()
+        if self.settings.rescore_after_refresh:
+            out["book"] = self.score_book()
+        return out
 
     def loaded_cache(self, auto_refresh: bool) -> LoadedCache:
         if auto_refresh and self.cache.is_stale(self.storage):
@@ -177,32 +209,78 @@ class EWSPipeline:
 
     # ---- request-level API ------------------------------------------------------------------------------
     def score(self, req: ScoreRequest) -> dict[str, Any]:
+        """Answer a /predict/ews request.
+
+        Whole-book requests for the latest day are read from the stored book run
+        (no forward pass) when one matches the current data, model, horizon and
+        triggers; paths for flagged accounts then need a forward pass over those
+        accounts only. Everything else is scored live."""
         t0 = time.perf_counter()
         cache = self.loaded_cache(req.auto_refresh)
-        rows, unknown = cache.rows_for(req.account_ids)
         as_of = req.as_of_date or cache.end
-        run_id = "run_" + uuid.uuid4().hex[:12]
-        if len(rows) == 0:
-            return {"run_id": run_id, "as_of_date": as_of, "horizon": req.horizon, "accounts": [],
-                    "unknown_accounts": unknown, "summary": self._summary([], 0, t0)}
+        meta = {"cache_version": cache.meta.version, "model_version": self.engine.model_version,
+                "backend": self.engine.name}
+        if req.account_ids is None and req.use_stored and req.paths != "all" and as_of == cache.end:
+            run = self.alerts.latest_book_run(
+                cache.meta.version, req.horizon, req.liability_quantile, req.asset_quantile, self.engine.model_version
+            )
+            if run is not None:
+                return self._from_stored(cache, run, req, t0, meta)
 
+        rows, unknown = cache.rows_for(req.account_ids)
+        run_id = "run_" + uuid.uuid4().hex[:12]
+        base = {"run_id": run_id, "as_of_date": as_of, "horizon": req.horizon, "source": "live",
+                "scored_at": utcnow(), **meta, "unknown_accounts": unknown}
+        if len(rows) == 0:
+            return {**base, "accounts": [], "alerts": [], "summary": self._summary([], 0, t0)}
         sb = self.score_rows(cache, rows, as_of, req.horizon, req.liability_quantile, req.asset_quantile)
-        accounts = self._account_payloads(cache, sb, req)
+        scores = self.score_table(cache, sb, run_id)
+        accounts = [_nest(r) for r in scores.to_pylist()]
+        self._attach_paths(accounts, sb, np.arange(len(rows)), req)
         alerts = self.alert_table(cache, sb, run_id)
         if req.persist_alerts:
             scope = cache.accounts["account_id"].iloc[rows].tolist()
             self.alerts.record_run(self._run_row(run_id, as_of, req, len(rows), alerts), scope, alerts)
         alert_rows = alerts.to_pylist()
-        return {
-            "run_id": run_id,
-            "as_of_date": as_of,
-            "horizon": req.horizon,
-            "backend": self.engine.name,
-            "accounts": accounts,
-            "unknown_accounts": unknown,
-            "alerts": alert_rows,
-            "summary": self._summary(accounts, len(alert_rows), t0),
-        }
+        return {**base, "accounts": accounts, "alerts": alert_rows,
+                "summary": self._summary(accounts, len(alert_rows), t0)}
+
+    def _from_stored(self, cache: LoadedCache, run: dict, req: ScoreRequest, t0: float, meta: dict) -> dict[str, Any]:
+        accounts = [_nest(r) for r in self.alerts.scores(run["run_id"]).to_pylist()]
+        if req.paths == "flagged":
+            flagged = [i for i, a in enumerate(accounts) if a["risk_tier"] != "GREEN"]
+            if flagged:
+                rows, _ = cache.rows_for([accounts[i]["account_id"] for i in flagged])
+                sb = self.score_rows(cache, rows, cache.end, req.horizon, req.liability_quantile, req.asset_quantile)
+                sub = [accounts[i] for i in flagged]
+                self._attach_paths(sub, sb, np.arange(len(rows)), ScoreRequest(
+                    paths="all", return_quantiles=req.return_quantiles))
+        return {"run_id": run["run_id"], "as_of_date": run["as_of_date"], "horizon": run["horizon"],
+                "source": "stored", "scored_at": run["created_at"], **meta, "unknown_accounts": [],
+                "accounts": accounts, "alerts": [], "summary": self._summary(accounts, int(run["n_alerts"]), t0)}
+
+    def _attach_paths(self, accounts: list[dict], sb: ScoredBatch, local: np.ndarray, req: ScoreRequest) -> None:
+        """Add forecast paths in place, vectorised: one rounding and one tolist per channel."""
+        if req.paths == "none" or len(local) == 0:
+            return
+        if req.paths == "flagged":
+            local = np.array([i for i in local if accounts[i]["risk_tier"] != "GREEN"], dtype=int)
+            if local.size == 0:
+                return
+        qidx = [QUANTILES.index(q) for q in req.return_quantiles]
+        names = [f"q{int(round(QUANTILES[k] * 100))}" for k in qidx]
+        dates = [sb.as_of + timedelta(days=d + 1) for d in range(sb.horizon)]
+        bal = np.round(sb.q[local][:, 0][:, :, qidx], 2).transpose(0, 2, 1).tolist()
+        util = np.round(sb.q[local][:, 1][:, :, qidx], 4).transpose(0, 2, 1).tolist()
+        emi = sb.known_future[local, :, 0]
+        for j, i in enumerate(local):
+            due = np.flatnonzero(emi[j] > 0)
+            accounts[i]["forecast"] = {
+                "dates": dates,
+                "balance": dict(zip(names, bal[j], strict=True)),
+                "utilization": dict(zip(names, util[j], strict=True)),
+                "emi_schedule": [{"date": dates[d], "amount": round(float(emi[j, d]), 2)} for d in due],
+            }
 
     def _run_row(self, run_id: str, as_of: date, req: ScoreRequest, n: int, alerts: pa.Table) -> dict[str, Any]:
         el = alerts.column("expected_loss").to_pylist() if alerts.num_rows else []
@@ -377,70 +455,6 @@ class EWSPipeline:
             logger.info("book scored: {} accounts x horizons {} in {:.1f}s", cache.n_accounts, hs, time.perf_counter() - t0)
             return {"runs": runs, "alert_horizon": alert_h, "alerts": totals[alert_h]["n_alerts"],
                     "seconds": round(time.perf_counter() - t0, 2)}
-
-    def _account_payloads(self, cache: LoadedCache, sb: ScoredBatch, req: ScoreRequest) -> list[dict[str, Any]]:
-        r, bh, sn = sb.risk, sb.behavior, sb.snapshot
-        acc = cache.accounts.iloc[sb.rows].reset_index(drop=True)
-        dates = [(sb.as_of + timedelta(days=i + 1)).isoformat() for i in range(sb.horizon)]
-        qidx = [QUANTILES.index(q) for q in req.return_quantiles]
-        out = []
-        for i in range(len(sb.rows)):
-            in_sma = r.tier[i] != "GREEN"
-            item: dict[str, Any] = {
-                "account_id": acc.at[i, "account_id"],
-                "rm_id": _s(acc.at[i, "rm_id"]),
-                "segment": _s(acc.at[i, "segment"]),
-                "product_type": _s(acc.at[i, "product_type"]),
-                "risk_tier": r.tier[i],
-                "days_to_breach": _day(r.days_to_breach[i]),
-                "breach_date": (sb.as_of + timedelta(days=int(r.days_to_breach[i]))).isoformat()
-                if r.days_to_breach[i] > 0 else None,
-                "breach_shortfall": _f(r.breach_shortfall[i]) if in_sma else None,
-                "days_to_zero": _day(r.days_to_zero[i]),
-                "current_balance": _f(sn.current_balance[i]),
-                "current_utilization": _f(sn.current_utilization[i], 4),
-                "next_emi": {
-                    "date": (sb.as_of + timedelta(days=int(r.next_emi_day[i]))).isoformat(),
-                    "amount": _f(r.next_emi_amount[i]),
-                } if r.next_emi_day[i] > 0 else None,
-                "probability_of_default": _f(r.pd[i], 4),
-                "pd_components": {
-                    "cash_shortfall": _f(r.pd_cash[i], 4),
-                    "utilization_breach": _f(r.p_util[i], 4),
-                    "bureau": _f(r.pd_bureau[i], 4),
-                },
-                "exposure_at_default": _f(r.ead[i]),
-                "loss_given_default": _f(r.lgd[i], 4),
-                "expected_loss": _f(r.expected_loss[i]) if in_sma else None,
-                "priority_score": _f(r.priority[i]),
-                "cibil_score": _f(sn.cibil[i], 0),
-                "triggers": r.triggers[i],
-                "behavior": {
-                    "trailing_avg_balance_90d": _f(bh.trailing_avg_90d[i]),
-                    "baseline_avg_balance": _f(bh.baseline_avg[i]),
-                    "projected_avg_balance": _f(bh.projected_avg[i]),
-                    "projected_change_pct": _f(bh.projected_change_pct[i] * 100, 2),
-                    "projected_min_balance_worst_case": _f(bh.projected_min_worst[i]),
-                    "trend": bh.trend[i],
-                    "attrition_alert": bool(bh.attrition_alert[i]),
-                    "projected_balance_drop": _f(bh.projected_balance_drop[i]),
-                    "cof_impact_annual": _f(bh.cof_impact_annual[i]),
-                },
-            }
-            if req.include_paths:
-                item["forecast"] = {
-                    "dates": dates,
-                    "balance": {f"q{int(round(QUANTILES[k] * 100))}": np.round(sb.q[i, 0, :, k], 2).tolist() for k in qidx},
-                    "utilization": {
-                        f"q{int(round(QUANTILES[k] * 100))}": np.round(sb.q[i, 1, :, k], 4).tolist() for k in qidx
-                    },
-                    "emi_schedule": [
-                        {"date": dates[d], "amount": _f(sb.known_future[i, d, 0])}
-                        for d in np.flatnonzero(sb.known_future[i, :, 0] > 0)
-                    ],
-                }
-            out.append(item)
-        return out
 
     @staticmethod
     def _summary(accounts: list[dict[str, Any]], n_alerts: int, t0: float) -> dict[str, Any]:

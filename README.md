@@ -253,6 +253,36 @@ Caveats:
 
 Interactive docs: `/docs`.
 
+## Request latency: read path vs write path
+
+`/predict/ews` never refreshes data or rebuilds the cache inside a request.
+Ingest and `POST /api/v1/aggregate/refresh` refresh in the background, and
+then rescore the whole book (`score_book`): one forward pass, with results
+stored per horizon (30/60/90) in `account_scores`. Only the 90-day run raises
+alerts. `POST /api/v1/score/book` runs the same job on demand, for example
+nightly.
+
+A whole-book request for the latest day is read from the stored run when it
+matches the current data version, model version (a hash of the weights),
+horizon and triggers; the response says `"source": "stored"`. Anything else
+is scored live (`"source": "live"`). `include_paths` controls paths:
+
+* omitted: none for the whole book, all for account lists
+* `"flagged"`: non-GREEN accounts only
+* `true`: everything
+
+Responses are serialised with orjson.
+
+Measured in-process on Berka (4,500 accounts, 4-core CPU), with `scripts/bench_api_latency.py`:
+
+| Request | Before | After |
+|---|---|---|
+| Whole book, default | 5.8 s (live) | **47 ms** (stored) |
+| Whole book, paths for flagged accounts | n/a | **87 ms** |
+| Whole book, every path (explicitly live) | 6.6 s | 6.4 s |
+| 20 accounts with paths | 47 ms | 53 ms |
+| 20 accounts right after an ingest | 6.5 s (inline refresh) | **40 ms** |
+
 ## Scaling out
 
 * **PostgreSQL:** `EWS_STORAGE__BACKEND=postgres` and

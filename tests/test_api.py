@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import create_app
+from api.schemas import PredictResponse
 
 
 @pytest.fixture(scope="module")
@@ -30,10 +31,13 @@ def test_health_and_info(client):
 def test_predict_contract(client, horizon):
     r = client.post(
         "/api/v1/predict/ews",
-        json={"horizon": horizon, "return_quantiles": [0.1, 0.5, 0.9], "persist_alerts": False},
+        json={"horizon": horizon, "return_quantiles": [0.1, 0.5, 0.9], "persist_alerts": False,
+              "include_paths": True},
     )
     assert r.status_code == 200, r.text
     body = r.json()
+    PredictResponse.model_validate(body)  # orjson output still honours the documented contract
+    assert body["source"] == "live"
     assert body["horizon"] == horizon and body["summary"]["accounts_scored"] == 30
     a = body["accounts"][0]
     assert set(a["forecast"]["balance"]) == {"q10", "q50", "q90"}
@@ -63,7 +67,8 @@ def test_predict_validation(client):
 
 
 def test_alerts_ranked_json_sse_and_ack(client):
-    r = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": False})
+    # live scoring with persistence (paths force a live run) raises this run's alerts
+    r = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": True})
     assert r.status_code == 200
     raised = r.json()["summary"]["alerts_raised"]
     data = client.get("/api/v1/alerts/active", params={"limit": 500}).json()
@@ -89,7 +94,7 @@ def test_alerts_ranked_json_sse_and_ack(client):
         after = client.get("/api/v1/alerts/active", params={"limit": 500}).json()
         assert after["total"] == raised - 1
     # a re-run supersedes the previous run's alerts instead of duplicating them
-    client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": False})
+    client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": True})
     again = client.get("/api/v1/alerts/active", params={"limit": 500}).json()
     assert again["total"] == raised
 
@@ -174,9 +179,57 @@ def test_dataset_ingest_rejects_paths_outside_data_dir(client):
 
 
 def test_run_expected_loss_matches_portfolio_summary(client):
-    body = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": False}).json()
+    body = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": True}).json()
     runs = client.get("/api/v1/runs", params={"limit": 1}).json()
     assert runs[0]["run_id"] == body["run_id"]
     assert runs[0]["total_expected_loss"] == pytest.approx(body["summary"]["total_expected_loss"], abs=1.0)
     alerts = client.get("/api/v1/alerts/active", params={"alert_type": "DEPOSIT_ATTRITION", "limit": 500}).json()
     assert all(a["expected_loss"] is None for a in alerts["alerts"])
+
+
+
+def _strip(accounts):
+    return sorted(({k: v for k, v in a.items() if k != "forecast"} for a in accounts), key=lambda a: a["account_id"])
+
+
+def test_whole_book_is_served_from_the_stored_run(client):
+    client.post("/api/v1/score/book", params={"wait": "true"}).raise_for_status()
+    stored = client.post("/api/v1/predict/ews", json={"horizon": 90}).json()
+    PredictResponse.model_validate(stored)
+    assert stored["source"] == "stored"
+    assert all("forecast" not in a for a in stored["accounts"])  # whole book: no paths by default
+    live = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": True,
+                                                     "persist_alerts": False}).json()
+    assert live["source"] == "live"
+    assert _strip(stored["accounts"]) == _strip(live["accounts"])  # same numbers either way
+    for h in (30, 60):
+        assert client.post("/api/v1/predict/ews", json={"horizon": h}).json()["source"] == "stored"
+    # other triggers were not stored: answered live, still correct
+    other = client.post("/api/v1/predict/ews", json={"quantile_triggers": {"liability": 0.3, "asset": 0.9}}).json()
+    assert other["source"] == "live"
+
+
+def test_flagged_paths_only_for_flagged_accounts(client):
+    client.post("/api/v1/score/book", params={"wait": "true"}).raise_for_status()
+    body = client.post("/api/v1/predict/ews", json={"horizon": 90, "include_paths": "flagged"}).json()
+    assert body["source"] == "stored"
+    for a in body["accounts"]:
+        assert ("forecast" in a) == (a["risk_tier"] != "GREEN")
+    # account lists keep paths by default
+    one = client.post("/api/v1/predict/ews", json={"account_ids": ["AC00000002"], "persist_alerts": False}).json()
+    assert "forecast" in one["accounts"][0]
+
+
+def test_predict_never_refreshes_inside_the_request(client):
+    before = client.post("/api/v1/predict/ews", json={"account_ids": ["AC00000002"], "persist_alerts": False}).json()
+    row = client.app.state.services.pipeline.storage.query_arrow(
+        "SELECT * FROM daily_balances WHERE account_id = 'AC00000002' ORDER BY as_of_date DESC LIMIT 1").to_pylist()[0]
+    row = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+    client.post("/api/v1/ingest", json={"daily_balances": [row], "refresh_features": False}).raise_for_status()
+    after = client.post("/api/v1/predict/ews", json={"account_ids": ["AC00000002"], "persist_alerts": False}).json()
+    assert after["cache_version"] == before["cache_version"]  # no inline refresh / cache rebuild
+    # the write path refreshes and rescores; the next whole-book read is stored again
+    client.post("/api/v1/aggregate/refresh").raise_for_status()
+    client.post("/api/v1/score/book", params={"wait": "true"}).raise_for_status()
+    book = client.post("/api/v1/predict/ews", json={"horizon": 90}).json()
+    assert book["source"] == "stored" and book["cache_version"] != before["cache_version"]

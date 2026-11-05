@@ -35,6 +35,8 @@ def _warm(pipeline: EWSPipeline) -> None:
         if has_data:
             pipeline.refresh()
         _ = pipeline.engine  # load model weights once, up front
+        if has_data and pipeline.settings.rescore_after_refresh:
+            pipeline.score_book()  # no-op when a stored run already matches data + model
     except Exception as exc:  # the API still serves ingestion without a model
         logger.warning("warm-up incomplete: {}", exc)
 

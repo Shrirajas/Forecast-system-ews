@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+import orjson
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from api.deps import Services, services
@@ -15,7 +17,7 @@ router = APIRouter(prefix="/api/v1", tags=["prediction"])
 
 
 @router.post("/predict/ews", response_model=PredictResponse, summary="Run the EWS forecast for a batch of accounts")
-async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(services)]) -> PredictResponse:
+async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(services)]) -> Response:
     """Runs the multivariate forecaster over the selected accounts (or the
     whole book) and returns, per account:
 
@@ -29,6 +31,10 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
     Inference runs on a worker thread (GPU autocast when available) so the
     event loop keeps serving other requests.
     """
+    if req.include_paths is None:
+        paths = "none" if req.account_ids is None else "all"
+    else:
+        paths = "flagged" if req.include_paths == "flagged" else ("all" if req.include_paths else "none")
     sreq = ScoreRequest(
         account_ids=req.account_ids,
         horizon=req.horizon,
@@ -36,8 +42,9 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
         liability_quantile=req.quantile_triggers.liability,
         asset_quantile=req.quantile_triggers.asset,
         return_quantiles=req.return_quantiles,
-        include_paths=req.include_paths,
+        paths=paths,
         persist_alerts=req.persist_alerts,
+        auto_refresh=False,  # refreshes happen after ingest / nightly, never inside a request
     )
     try:
         out = await run_in_threadpool(svc.pipeline.score, sreq)
@@ -54,13 +61,35 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
     if req.tiers:
         wanted = set(req.tiers)
         accounts = [a for a in accounts if a["risk_tier"] in wanted]
-    return PredictResponse(
-        run_id=out["run_id"],
-        as_of_date=out["as_of_date"],
-        horizon=out["horizon"],
-        backend=out.get("backend"),
-        quantile_triggers=req.quantile_triggers,
-        summary=out["summary"],
-        unknown_accounts=out["unknown_accounts"],
-        accounts=accounts,
-    )
+    body = {
+        "run_id": out["run_id"],
+        "as_of_date": out["as_of_date"],
+        "horizon": out["horizon"],
+        "source": out["source"],
+        "scored_at": out["scored_at"],
+        "cache_version": out["cache_version"],
+        "model_version": out["model_version"],
+        "backend": out.get("backend"),
+        "quantile_triggers": req.quantile_triggers.model_dump(),
+        "summary": out["summary"],
+        "unknown_accounts": out["unknown_accounts"],
+        "accounts": accounts,
+    }
+    # The pipeline builds this payload from typed, validated columns; serialise it directly
+    # (orjson) instead of re-validating thousands of accounts through Pydantic.
+    return Response(orjson.dumps(body, option=orjson.OPT_NAIVE_UTC), media_type="application/json")
+
+
+@router.post("/score/book", summary="Score the whole book now and store it (write path)")
+async def score_book(
+    svc: Annotated[Services, Depends(services)], background: BackgroundTasks, wait: bool = False, force: bool = False
+) -> dict:
+    """Runs the nightly whole-book job: one forward pass, stored per horizon, alerts
+    from the 90-day run. Whole-book /predict/ews reads are served from it."""
+    if wait:
+        try:
+            return await run_in_threadpool(svc.pipeline.score_book, None, force)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+    background.add_task(svc.pipeline.score_book, None, force)
+    return {"status": "scheduled"}
