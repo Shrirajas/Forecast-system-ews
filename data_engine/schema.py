@@ -179,6 +179,7 @@ FORECAST_RUNS = Table(
         ("cache_version", "str", True),  # data version the run scored
         ("liability_quantile", "f64", True),
         ("asset_quantile", "f64", True),
+        ("model_version", "str", True),  # exact weights that produced the run
     ),
     ("run_id",),
     (("scope", "cache_version"),),
@@ -224,11 +225,17 @@ ACCOUNT_SCORES = Table(
         ("attrition_alert", "i16", True),
         ("projected_balance_drop", "f64", True),
         ("cof_impact_annual", "f64", True),
+        ("created_at", "ts", True),
     ),
     ("run_id", "account_id"),
+    (("run_id",),),
 )
 
-RUN_SCOPE = Table("run_scope", (("run_id", "str", False), ("account_id", "str", False)), ("run_id", "account_id"))
+RUN_SCOPE = Table(
+    "run_scope",
+    (("run_id", "str", False), ("account_id", "str", False), ("created_at", "ts", True)),
+    ("run_id", "account_id"),
+)
 
 EWS_ALERTS = Table(
     "ews_alerts",

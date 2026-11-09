@@ -3,11 +3,13 @@
     python scripts/bench_api_latency.py --work data/berka --checkpoint artifacts/models/berka_stformer.pt
 
 Scenarios:
-  whole_book_paths     every account, forecast paths included
-  whole_book_no_paths  every account, no paths
-  accounts_20_paths    20 named accounts, paths included
-  after_ingest         a one-row ingest (no refresh requested), then 20 accounts:
-                       shows any freshness work done inside the request path
+  whole_book_default        every account, default options (stored book run when available)
+  whole_book_flagged_paths  every account, paths for flagged accounts only
+  whole_book_all_paths      every account, every path (always live)
+  whole_book_live_no_paths  every account, no paths, triggers with no stored run (q20): answered live
+  accounts_20_paths         20 named accounts, paths included
+  after_ingest              a one-row ingest (no refresh requested), then 20 accounts:
+                            shows any freshness work done inside the request path
 """
 
 from __future__ import annotations
@@ -52,8 +54,10 @@ def main() -> None:
         ids = [r["account_id"] for r in client.post(
             "/api/v1/predict/ews", json={"include_paths": False, "persist_alerts": False}).json()["accounts"][:20]]
         scenarios = {
-            "whole_book_paths": {"include_paths": True},
-            "whole_book_no_paths": {"include_paths": False},
+            "whole_book_default": {},
+            "whole_book_flagged_paths": {"include_paths": "flagged"},
+            "whole_book_all_paths": {"include_paths": True},
+            "whole_book_live_no_paths": {"include_paths": False, "quantile_triggers": {"liability": 0.2, "asset": 0.9}},
             "accounts_20_paths": {"account_ids": ids, "include_paths": True},
         }
         for name, body in scenarios.items():
@@ -72,7 +76,8 @@ def main() -> None:
                    "refresh_features": False}
         client.post("/api/v1/ingest", json=payload).raise_for_status()
         ms, size, body = timed(client, {"account_ids": ids, "include_paths": True})
-        results["after_ingest"] = {"ms": round(ms, 1), "response_mb": round(size / 1e6, 3)}
+        results["after_ingest"] = {"ms": round(ms, 1), "response_mb": round(size / 1e6, 3),
+                                   "source": body.get("source", "live")}
     print(json.dumps(results, indent=2))
 
 

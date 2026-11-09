@@ -28,10 +28,15 @@ from utils.logging import logger, setup_logging
 
 def _warm(pipeline: EWSPipeline) -> None:
     try:
+        removed = pipeline.alerts.cleanup_orphans()
+        if any(removed.values()):
+            logger.info("removed rows of unfinished runs: {}", removed)
         has_data = pipeline.storage.scalar("SELECT COUNT(*) FROM daily_balances")
         if has_data:
             pipeline.refresh()
         _ = pipeline.engine  # load model weights once, up front
+        if has_data and pipeline.settings.rescore_after_refresh:
+            pipeline.score_book()  # no-op when a stored run already matches data + model
     except Exception as exc:  # the API still serves ingestion without a model
         logger.warning("warm-up incomplete: {}", exc)
 

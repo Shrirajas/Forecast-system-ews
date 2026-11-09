@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -31,12 +32,23 @@ class ForecastEngine(ABC):
     context_length: int
     horizon_pad: int
 
+    #: Identifies the exact weights, so stored results are never served after a retrain.
+    model_version: str = "unknown"
+
     @abstractmethod
-    def forecast(self, past: np.ndarray, known: np.ndarray, horizon: int) -> np.ndarray:
-        """past ``[B, L, 6]`` (NaN = missing), known ``[B, L + horizon_pad, 3]``."""
+    def forecast(
+        self, past: np.ndarray, known: np.ndarray, horizon: int, has_credit_line: np.ndarray | None = None
+    ) -> np.ndarray:
+        """past ``[B, L, 6]`` (NaN = missing), known ``[B, L + horizon_pad, 3]``,
+        has_credit_line ``[B]`` bool from the account master (credit_limit > 0)."""
 
     def describe(self) -> dict:
-        return {"backend": self.name, "context_length": self.context_length, "horizon_pad": self.horizon_pad}
+        return {
+            "backend": self.name,
+            "model_version": self.model_version,
+            "context_length": self.context_length,
+            "horizon_pad": self.horizon_pad,
+        }
 
 
 class STFormerEngine(ForecastEngine):
@@ -48,6 +60,7 @@ class STFormerEngine(ForecastEngine):
                 f"model checkpoint not found at {checkpoint}; run `python scripts/bootstrap.py` "
                 "or `python scripts/train.py` first"
             )
+        self.model_version = "stformer:" + hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()[:16]
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
         self.cfg = STFormerConfig(**blob["config"])
         self.model = EWSForecaster(self.cfg)
@@ -63,7 +76,9 @@ class STFormerEngine(ForecastEngine):
         self.meta = {k: blob.get(k) for k in ("metrics", "epoch", "trained_at")}
         self._lock = threading.Lock()  # one forward at a time per model instance
 
-    def forecast(self, past: np.ndarray, known: np.ndarray, horizon: int) -> np.ndarray:
+    def forecast(
+        self, past: np.ndarray, known: np.ndarray, horizon: int, has_credit_line: np.ndarray | None = None
+    ) -> np.ndarray:
         if horizon > self.cfg.max_horizon:
             raise ValueError(f"horizon {horizon} > model max_horizon {self.cfg.max_horizon}")
         past_t = torch.from_numpy(np.ascontiguousarray(past, dtype=np.float32))
@@ -91,13 +106,12 @@ class TimesFM3Engine(ForecastEngine):
     * Balance and utilisation are multivariate targets, the four behavioural
       features are past-only covariates, and the EMI / holiday / payroll
       calendars are past-and-future covariates.
-    * Accounts whose utilisation history is all zero (no credit line, e.g. CASA
-      only) are forecast with balance as the only target; their utilisation
-      track is 0.
-    * Each account's context starts at its first observed day. Accounts are
-      batched by patch-rounded history length: the library pads a batch to its
-      longest series and padding changes the forecast, so this keeps padding
-      minimal and makes results independent of batch composition.
+    * Accounts without a credit line (``credit_limit == 0`` in the account
+      master, e.g. CASA only) are forecast with balance as the only target;
+      their utilisation track is 0. An undrawn line still gets a forecast.
+    * Each context is trimmed to a whole number of patches and only equal
+      lengths share a batch, so the library never pads and results do not
+      depend on batch composition.
     * Work is chunked with OOM backoff, runs under autocast on CUDA, and never
       uses symmetric averaging (which would double the forward passes).
 
@@ -135,6 +149,7 @@ class TimesFM3Engine(ForecastEngine):
         self.chunk_size = chunk_size
         self.use_autocast = autocast
         self.model_quantiles = np.asarray(self.model.config.quantiles, dtype=np.float64)
+        self.model_version = f"timesfm3:{checkpoint}:{getattr(self.model.config, 'revision', None) or 'main'}"
         self._lock = threading.Lock()
 
     def _to_ours(self, q: np.ndarray) -> np.ndarray:
@@ -168,23 +183,29 @@ class TimesFM3Engine(ForecastEngine):
 
         return np.concatenate(list(run_with_oom_backoff(run, len(rows), self.chunk_size)), axis=0)
 
-    def forecast(self, past: np.ndarray, known: np.ndarray, horizon: int) -> np.ndarray:
+    def forecast(
+        self, past: np.ndarray, known: np.ndarray, horizon: int, has_credit_line: np.ndarray | None = None
+    ) -> np.ndarray:
         b, L = past.shape[:2]
         out = np.zeros((b, 2, horizon, len(QUANTILES)), dtype=np.float32)
         if b == 0:
             return out
         observed = ~np.isnan(past[:, :, 0])
-        start = np.where(observed.any(1), observed.argmax(1), L - 1)
-        has_util = np.nan_to_num(np.abs(past[:, :, 1])).max(1) > 0
+        length = np.where(observed.any(1), L - observed.argmax(1), 1)
         patch = int(getattr(self.model.config, "input_patch_length", 32))
-        bucket = -(-(L - start) // patch)  # history length in patches
+        # The library pads every batch to its longest series and padding shifts the
+        # forecast. Trim each context to a whole number of patches (dropping at most
+        # patch-1 of the oldest days) and batch only equal lengths: no padding at
+        # all, so an account's forecast is identical whatever shares its batch.
+        length = np.where(length >= patch, (length // patch) * patch, length)
+        start = L - length
+        if has_credit_line is None:  # fall back to history when the master has no limit data
+            has_credit_line = np.nan_to_num(np.abs(past[:, :, 1])).max(1) > 0
+        has_credit_line = np.asarray(has_credit_line, dtype=bool)
         with self._lock:
-            for util_flag, n_targets in ((True, 2), (False, 1)):
-                for nb in np.unique(bucket[has_util == util_flag]):
-                    # The library pads each batch to its longest series and padding shifts
-                    # the forecast; equal patch-rounded lengths make every account's result
-                    # independent of which accounts share its batch.
-                    rows = np.flatnonzero((has_util == util_flag) & (bucket == nb))
+            for line, n_targets in ((True, 2), (False, 1)):
+                for n in np.unique(length[has_credit_line == line]):
+                    rows = np.flatnonzero((has_credit_line == line) & (length == n))
                     q = self._to_ours(self._predict(past, known, start, rows, n_targets, horizon))
                     out[rows, :n_targets] = q
         return out
@@ -201,11 +222,11 @@ def get_engine(settings: Settings, reload: bool = False) -> ForecastEngine:
             m = settings.model
             ctx = get_device_context(m.amp_dtype, m.cuda_memory_fraction)
             if m.backend == "timesfm3":
-                if settings.environment == "prod" and not m.allow_noncommercial_weights:
+                if not m.allow_noncommercial_weights:
                     raise RuntimeError(
-                        "TimesFM 3.0 weights are licensed for non-commercial, non-production use; "
-                        "use the stformer backend in production (or set "
-                        "EWS_MODEL__ALLOW_NONCOMMERCIAL_WEIGHTS=true for a licensed research setup)"
+                        "TimesFM 3.0 weights are licensed for non-commercial, non-production use only "
+                        "(that includes commercial demos and pilots). Use the stformer backend, or set "
+                        "EWS_MODEL__ALLOW_NONCOMMERCIAL_WEIGHTS=true for genuinely non-commercial research."
                     )
                 logger.warning("TimesFM 3.0 weights: non-commercial licence, research use only")
                 hp = -(-m.max_horizon // m.patch_length) * m.patch_length

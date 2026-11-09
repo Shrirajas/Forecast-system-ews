@@ -27,16 +27,27 @@ def _stats(r: IngestResult) -> TableIngestStats:
 
 async def _refresh(svc: Services, wait: bool, background: BackgroundTasks) -> tuple[str, dict | None]:
     if wait:
-        return "completed", await run_in_threadpool(svc.pipeline.refresh)
+        result = await run_in_threadpool(svc.pipeline.refresh)
+        background.add_task(_safe_rescore, svc)  # the book rescore still runs after the response
+        return "completed", result
     background.add_task(_safe_refresh, svc)
     return "scheduled", None
 
 
 def _safe_refresh(svc: Services) -> None:
     try:
-        svc.pipeline.refresh()
+        svc.pipeline.refresh_and_rescore()
     except Exception:  # background task: log, never crash the worker
-        logger.exception("background feature refresh failed")
+        logger.exception("background refresh / book rescore failed")
+
+
+def _safe_rescore(svc: Services) -> None:
+    if not svc.settings.rescore_after_refresh:
+        return
+    try:
+        svc.pipeline.score_book()
+    except Exception:
+        logger.exception("background book rescore failed")
 
 
 @router.post("/ingest", response_model=IngestResponse, summary="Ingest a daily batch (JSON)")
@@ -142,5 +153,9 @@ async def ingest_dataset(
 
 
 @router.post("/aggregate/refresh", summary="Run the incremental nightly aggregation + cache rebuild")
-async def aggregate_refresh(svc: Annotated[Services, Depends(services)], full: bool = False) -> dict:
-    return await run_in_threadpool(svc.pipeline.refresh, full, full)
+async def aggregate_refresh(
+    svc: Annotated[Services, Depends(services)], background: BackgroundTasks, full: bool = False
+) -> dict:
+    result = await run_in_threadpool(svc.pipeline.refresh, full, full)
+    background.add_task(_safe_rescore, svc)
+    return result

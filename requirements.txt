@@ -18,6 +18,7 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.8
 pydantic-settings>=2.4
+orjson>=3.10          # fast JSON for large /predict/ews responses
 python-multipart>=0.0.9    # streaming multipart uploads for /api/v1/ingest/file
 pyarrow>=17
 duckdb>=1.1

@@ -156,7 +156,11 @@ class PredictRequest(BaseModel):
     as_of_date: date | None = Field(None, description="Forecast origin (defaults to the latest data day)")
     quantile_triggers: QuantileTriggers = Field(default_factory=QuantileTriggers)
     return_quantiles: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
-    include_paths: bool = True
+    include_paths: bool | Literal["flagged"] | None = Field(
+        None,
+        description="Forecast paths: true = every account, \"flagged\" = non-GREEN accounts only, false = none. "
+        "Default: none for whole-book requests (served from the stored book run), all for account lists.",
+    )
     tiers: list[Tier] | None = Field(None, description="Only return accounts in these tiers")
     persist_alerts: bool = True
 
@@ -248,6 +252,10 @@ class PredictResponse(BaseModel):
     run_id: str
     as_of_date: date
     horizon: int
+    source: Literal["stored", "live"] = Field(description="stored = read from the latest book run, no forward pass")
+    scored_at: datetime
+    cache_version: str
+    model_version: str
     backend: str | None = None
     quantile_triggers: QuantileTriggers
     summary: PredictSummary

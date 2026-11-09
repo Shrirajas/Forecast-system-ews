@@ -61,9 +61,11 @@ class ModelSettings(BaseModel):
     timesfm_checkpoint: str = "google/timesfm-3.0-pytorch"
     #: Series per TimesFM forward pass (the library's own default is 4).
     timesfm_batch_size: int = 64
-    #: Run TimesFM under bf16/fp16 autocast on CUDA.
-    timesfm_autocast: bool = True
-    #: Required to load TimesFM 3.0 weights when environment == "prod" (licence acknowledgement).
+    #: Run TimesFM under bf16/fp16 autocast on CUDA. Off until validated against fp32
+    #: (wQL and q10-q90 coverage on real balances); large balances are where bf16 rounding shows.
+    timesfm_autocast: bool = False
+    #: Must be true to load TimesFM 3.0 weights in any environment: their licence forbids
+    #: commercial and production use, including commercial demos.
     allow_noncommercial_weights: bool = False
 
     context_length: int = 512  # 512 daily tokens ~= 18 months of EOD history
@@ -157,6 +159,10 @@ class Settings(BaseSettings):
     book_horizons: tuple[int, ...] = (30, 60, 90)
     #: Accounts per shard when scoring the whole book (bounds memory on large books).
     book_shard_size: int = 50_000
+    #: The one book horizon that raises alerts; the others only store scores.
+    book_alert_horizon: int = 90
+    #: Stored book runs kept per horizon; older runs' per-account scores are deleted.
+    keep_book_runs: int = 3
 
     storage: StorageSettings = Field(default_factory=StorageSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
