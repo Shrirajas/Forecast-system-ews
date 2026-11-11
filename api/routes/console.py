@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 import time
 import uuid
 from pathlib import Path
@@ -21,23 +22,19 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from api import connection as conn
-from api.deps import Services, services
+from api.deps import Services, local_only, services
+from api import compare_store
+from config.registry import dataset_info, match_dataset
+from models.risk import tier_label
+from utils.timefmt import to_ist
 from data_engine import importer
 from data_engine.ingestion import IngestionEngine
 from data_engine.storage import get_storage
-from models.engine import reset_engine
+from models.engine import get_engine
 from models.pipeline import EWSPipeline
 from models.train import cpu_profile, train_model
 
-_LOCAL = {"127.0.0.1", "::1", "localhost", "testclient"}
 UPLOAD_SUFFIXES = {".csv": "csv", ".txt": "csv", ".parquet": "parquet", ".pq": "parquet"}
-
-
-def local_only(request: Request) -> None:
-    svc: Services = request.app.state.services
-    host = request.client.host if request.client else ""
-    if not svc.settings.admin_allow_remote and host not in _LOCAL:
-        raise HTTPException(403, "console admin endpoints are limited to this machine (admin_allow_remote=false)")
 
 
 router = APIRouter(prefix="/api/v1", tags=["console"], dependencies=[Depends(local_only)])
@@ -46,9 +43,12 @@ Svc = Annotated[Services, Depends(services)]
 
 # ------------------------------------------------------------------------------------- overview
 @router.get("/console/overview", summary="Everything the console home page shows")
-async def overview(svc: Svc) -> dict[str, Any]:
+async def overview(request: Request, svc: Svc) -> dict[str, Any]:
+    rt = request.app.state.runtime
+
     def collect() -> dict[str, Any]:
         p = svc.pipeline
+        spec = rt.registry.get(svc.dataset_id or "")
         cache = p.cache.load()
         model: dict[str, Any] = {"backend": svc.settings.model.backend,
                                  "checkpoint": str(svc.settings.model.checkpoint_path),
@@ -56,6 +56,7 @@ async def overview(svc: Svc) -> dict[str, Any]:
         if model["exists"] or svc.settings.model.backend != "stformer":
             try:
                 model.update(p.engine.describe())
+                model["trained_at"] = to_ist(model.get("trained_at"), naive="ist")  # checkpoints store local time
             except Exception as exc:
                 model["error"] = str(exc)
         book = None
@@ -66,12 +67,22 @@ async def overview(svc: Svc) -> dict[str, Any]:
             tiers = p.storage.query_arrow(
                 "SELECT risk_tier, COUNT(*) AS n, SUM(expected_loss) AS el FROM account_scores "
                 "WHERE run_id = :r GROUP BY risk_tier", {"r": r["run_id"]}).to_pylist()
-            book = {"run_id": r["run_id"], "scored_at": r["created_at"], "horizon": r["horizon"],
+            book = {"run_id": r["run_id"], "scored_at": to_ist(r["created_at"]), "horizon": r["horizon"],
                     "accounts": r["n_accounts"], "alerts": r["n_alerts"],
                     "total_expected_loss": r["total_expected_loss"],
                     "up_to_date": bool(cache and r.get("cache_version") == cache.meta.version),
                     "tiers": {t["risk_tier"]: t["n"] for t in tiers}}
+        counts = p.alerts.counts()
+        alert_counts = {"active": counts.get("ACTIVE", 0), "acknowledged": counts.get("ACKNOWLEDGED", 0),
+                        "superseded": counts.get("SUPERSEDED", 0), "pending": counts.get("PENDING", 0),
+                        "total_rows_all_runs": sum(counts.values())}
+        extra = _kpis(svc, spec, book, alert_counts, runs, cache)
         return {
+            **extra,
+            "model_status": rt.model_info(rt.active_model),
+            "alert_counts": alert_counts,
+            "tables_note": "Row counts of the stored tables. ews_alerts counts the rows of ALL runs "
+                           "(active and superseded); the headline alert count is alert_counts.active.",
             "connection": conn.describe(svc.settings),
             "tables": p.storage.table_counts(),
             "data": None if cache is None else {"accounts": cache.n_accounts, "first_day": cache.start,
@@ -82,6 +93,55 @@ async def overview(svc: Svc) -> dict[str, Any]:
         }
 
     return await run_in_threadpool(collect)
+
+
+def _kpis(svc: Services, spec, book: dict | None, ac: dict, runs: list, cache) -> dict[str, Any]:
+    """Overview extras. ``None`` = unavailable (never 0)."""
+    cfg, p = svc.settings.risk, svc.pipeline
+    thr = cfg.high_risk_pd_threshold
+    dist, high, note = None, None, None
+    if book:
+        rid = {"r": book["run_id"]}
+        if spec is None or spec.capabilities.get("projected_sma"):
+            t = book["tiers"]
+            dist = [{"id": k, "label": tier_label(k), "count": int(t.get(k, 0)), "tone": tone}
+                    for k, tone in (("SMA-2", "red"), ("SMA-1", "orange"), ("SMA-0", "yellow"), ("GREEN", "green"))]
+            note = "Projected tiers are forecasts, not regulatory classifications. GREEN is not a guarantee of low credit risk."
+        else:
+            rows = p.storage.query_arrow(
+                "SELECT CASE WHEN probability_of_default IS NULL THEN 'na' WHEN probability_of_default > :t THEN 'high' "
+                "WHEN probability_of_default > :t / 2 THEN 'mid' ELSE 'low' END AS b, COUNT(*) AS n "
+                "FROM account_scores WHERE run_id = :r GROUP BY 1", {**rid, "t": thr}).to_pylist()
+            n = {r["b"]: int(r["n"]) for r in rows}
+            dist = [{"id": "high", "label": f"PD above {thr:.0%}", "count": n.get("high", 0), "tone": "red"},
+                    {"id": "mid", "label": f"PD {thr / 2:.0%} to {thr:.0%}", "count": n.get("mid", 0), "tone": "orange"},
+                    {"id": "low", "label": f"PD below {thr / 2:.0%}", "count": n.get("low", 0), "tone": "green"},
+                    {"id": "na", "label": "No credit exposure (N/A)", "count": n.get("na", 0), "tone": "na"}]
+            note = "PD is a bureau-based estimate, not calibrated; this is not a regulatory classification."
+        hr = int(p.storage.scalar(
+            "SELECT COUNT(*) FROM account_scores WHERE run_id = :r AND expected_loss IS NOT NULL "
+            "AND (risk_tier <> 'GREEN' OR probability_of_default > :t)", {**rid, "t": thr}) or 0)
+        high = {"supported": True, "count": hr,
+                "definition": f"credit products with a projected SMA tier, or PD above {thr:.0%}"}
+    days: dict[str, dict[str, int]] = {}
+    for r in p.alerts.recent_runs(200):
+        d = (to_ist(r["created_at"]) or "")[:10]
+        e = days.setdefault(d, {"runs": 0, "accounts": 0})
+        e["runs"] += 1
+        e["accounts"] += int(r["n_accounts"] or 0)
+    saved = compare_store.list_saved(spec) if spec else []
+    return {
+        "timezone": "IST (UTC+05:30)",
+        "dataset": dataset_info(spec, svc.dataset_id) if spec else None,
+        "kpis": {"total_accounts": None if cache is None else cache.n_accounts,
+                 "accounts_forecasted": book["accounts"] if book else None,
+                 "high_risk": high or {"supported": False, "count": None, "definition": None},
+                 "active_alerts": ac["active"] if book else None,
+                 "last_forecast_at": book["scored_at"] if book else None},
+        "risk_distribution": dist, "risk_distribution_note": note,
+        "activity": [{"date": d, **v} for d, v in sorted(days.items())][-14:],
+        "recent_comparison": saved[0] if saved else None,
+    }
 
 
 # ------------------------------------------------------------------------------------ connection
@@ -111,6 +171,7 @@ async def switch_connection(spec: conn.ConnectionSpec, request: Request, svc: Sv
             ingestion=IngestionEngine(storage, batch_rows=new_settings.storage.stream_batch_rows),
             broker=svc.broker,
             jobs=svc.jobs,
+            dataset_id=match_dataset(new_settings, request.app.state.runtime.registry),
         )
 
     try:
@@ -313,17 +374,26 @@ class TrainRequest(BaseModel):
     steps_per_epoch: int | None = Field(None, ge=1, le=100_000)
 
 
+LOSS_NOTE = ("Training error is averaged over each epoch with dropout on; the check error is measured in eval mode on "
+             "accounts held out of training, so the training error can sit above the check error.")
+
+
 @router.get("/console/training", summary="Live progress of the current / last training run")
-async def training_progress(svc: Svc) -> dict[str, Any]:
-    path = Path(svc.settings.model.checkpoint_path).with_suffix(".progress.json")
+async def training_progress(request: Request, svc: Svc) -> dict[str, Any]:
+    rt = request.app.state.runtime
+    ck = Path(rt.training_ckpt or svc.settings.model.checkpoint_path)
+    path = ck.with_suffix(".progress.json")
+    meta = {"dataset_id": svc.dataset_id, "model_id": "stformer", "loss_note": LOSS_NOTE}
     if not path.exists():
-        return {"status": "none", "checkpoint": str(svc.settings.model.checkpoint_path)}
-    return json.loads(path.read_text())
+        return {"status": "none", "checkpoint": str(ck), **meta}
+    out = json.loads(path.read_text())
+    out["started_at"] = to_ist(out.get("started_at"), naive="ist")
+    return {**out, **meta}
 
 
 @router.post("/jobs/{kind}", summary="Start a background job: refresh, score-book or train")
 async def start_job(
-    kind: Literal["refresh", "score-book", "train"], svc: Svc, train: TrainRequest | None = None, wait: bool = False
+    kind: Literal["refresh", "score-book", "train"], request: Request, svc: Svc, train: TrainRequest | None = None, wait: bool = False
 ) -> dict[str, Any]:
     p, settings = svc.pipeline, svc.settings
     if kind == "refresh":
@@ -332,23 +402,35 @@ async def start_job(
     elif kind == "score-book":
         job = svc.jobs.submit("score-book", "Score the whole book (30/60/90 days)", lambda: p.score_book(force=True))
     else:
+        rt = request.app.state.runtime
+        if not rt.models[rt.active_model].supports_training:
+            raise HTTPException(422, {"code": "training_not_supported", "message":
+                                      f"{rt.models[rt.active_model].display_name} is a pretrained zero-shot model: there is nothing to train"})
         req = train or TrainRequest()
         epochs = req.epochs
+        # a NEW file every run: existing checkpoints are never overwritten
+        base = rt.registry[svc.dataset_id].checkpoint_path if svc.dataset_id else Path(settings.model.checkpoint_path)
+        ckpt = base.with_name(f"{base.stem}_{datetime.now().strftime('%Y%m%dT%H%M%S')}{base.suffix}")
+        rt.training_ckpt = str(ckpt)
 
         def do_train() -> dict[str, Any]:
             p.refresh()
             m = settings.model if torch.cuda.is_available() else cpu_profile(settings.model)
             m = m.model_copy(update={"epochs": epochs})
             try:
-                result = train_model(p.cache.current_dir(), m, checkpoint_path=settings.model.checkpoint_path,
-                                     max_steps_per_epoch=req.steps_per_epoch)
+                result = train_model(p.cache.current_dir(), m, checkpoint_path=ckpt, max_steps_per_epoch=req.steps_per_epoch)
             except Exception as e:
-                prog = Path(settings.model.checkpoint_path).with_suffix(".progress.json")
+                prog = ckpt.with_suffix(".progress.json")
                 if prog.exists():  # tell the Training tab instead of leaving it on "running"
                     prog.write_text(json.dumps({**json.loads(prog.read_text()), "status": "failed", "error": str(e)}))
                 raise
-            reset_engine()
+            if svc.dataset_id:  # remember the newest checkpoint of this dataset (resolve_checkpoint reads it)
+                spec = rt.registry[svc.dataset_id]
+                spec.checkpoint_path.with_name(f"{spec.id}_stformer.latest.json").write_text(json.dumps({"checkpoint": str(ckpt)}))
+            settings.model.checkpoint_path = ckpt
             p._engine = None  # pick up the new weights
+            get_engine(settings, "stformer", reload=True)
+            rt.engine_reloaded()
             return {"training": result.__dict__, "book": p.score_book(force=True)}
 
         job = svc.jobs.submit("train", f"Train the forecaster ({epochs} epochs) and rescore the book", do_train)

@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.logging import logger
+from utils.timefmt import to_ist
 
 
 @dataclass
@@ -33,7 +34,10 @@ class Job:
     error: str | None = None
 
     def view(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        for k in ("submitted_at", "started_at", "finished_at"):  # naive local (IST) -> explicit +05:30
+            d[k] = to_ist(d[k], naive="ist")
+        return d
 
 
 class JobManager:
@@ -61,6 +65,11 @@ class JobManager:
                 self._done.pop(old_id, None)
         self._q.put(job.id)
         return job
+
+    def active(self) -> list[Job]:
+        """Jobs that are queued or running (a dataset switch is refused while any exist)."""
+        with self._lock:
+            return [j for j in self._jobs.values() if j.status in ("queued", "running")]
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)

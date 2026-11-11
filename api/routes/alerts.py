@@ -8,11 +8,13 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any
 
+from utils.timefmt import IST
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from api.deps import Services, services
+from api.presentation import CATEGORY_ALERT, alert_display
 from api.schemas import AckResponse, ActiveAlertsResponse, AlertOut, AlertType, Tier
 
 router = APIRouter(prefix="/api/v1/alerts", tags=["alerts"])
@@ -40,6 +42,10 @@ async def active_alerts(
     include_acknowledged: bool = False,
     limit: Annotated[int, Query(ge=1, le=10_000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str | None, Query(max_length=32, description="Account id contains (case-insensitive)")] = None,
+    product_type: str | None = None,
+    category: Annotated[str | None, Query(description="predictive_warning | spending_behaviour_change | "
+                                          "repayment_failure | regulatory_classification")] = None,
     stream: Annotated[bool, Query(description="Server-Sent Events instead of JSON")] = False,
     follow: Annotated[bool, Query(description="With stream: keep the connection open and push new alerts")] = False,
 ):
@@ -55,13 +61,26 @@ async def active_alerts(
     list as SSE ``alert`` events; add ``follow=true`` to keep receiving
     alerts as new forecast runs raise them.
     """
+    if category is not None:
+        wanted = CATEGORY_ALERT.get(category)
+        if category not in ("predictive_warning", "spending_behaviour_change", "repayment_failure", "regulatory_classification"):
+            raise HTTPException(422, {"code": "unknown_category", "message": f"unknown category '{category}'"})
+        if wanted is None or (alert_type is not None and alert_type != wanted):
+            # repayment failures / regulatory classes need overdue data that no registered dataset has
+            return ActiveAlertsResponse(generated_at=datetime.now(IST), total=0, returned=0, alerts=[])
+        alert_type = wanted  # type: ignore[assignment]
     rows, total = await run_in_threadpool(
-        svc.pipeline.alerts.active, alert_type, tier, rm_id, min_priority, include_acknowledged, limit, offset
+        svc.pipeline.alerts.active, alert_type, tier, rm_id, min_priority, include_acknowledged, limit, offset, q, product_type
     )
+    ptypes = await run_in_threadpool(svc.pipeline.alerts.product_types, [r["account_id"] for r in rows])
+    spec = request.app.state.runtime.registry.get(svc.dataset_id or "")
+    for r in rows:
+        r["product_type"] = ptypes.get(r["account_id"])
+        r["display"] = alert_display(r, spec, svc.settings.risk)
     alerts = [AlertOut.model_validate(r) for r in rows]
     wants_sse = stream or "text/event-stream" in request.headers.get("accept", "")
     if not wants_sse:
-        return ActiveAlertsResponse(generated_at=datetime.now(), total=total, returned=len(alerts), alerts=alerts)
+        return ActiveAlertsResponse(generated_at=datetime.now(IST), total=total, returned=len(alerts), alerts=alerts)
 
     def matches(a: dict[str, Any]) -> bool:
         return (

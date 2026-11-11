@@ -70,6 +70,20 @@ def holdout_split(n_accounts: int, val_fraction: float, seed: int) -> tuple[np.n
     return perm[:n_val], perm[n_val:]
 
 
+def split_rows_by_group(
+    groups: np.ndarray, val_fraction: float, test_fraction: float, seed: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(train, validation, test) rows where every group (e.g. a customer owning several cards) lands
+    wholly in one of the three sets."""
+    uniq = np.unique(groups)
+    perm = np.random.default_rng(seed).permutation(len(uniq))
+    n_test, n_val = int(round(len(uniq) * test_fraction)), int(round(len(uniq) * val_fraction))
+    is_test = np.isin(groups, uniq[perm[:n_test]])
+    is_val = np.isin(groups, uniq[perm[n_test : n_test + n_val]])
+    rows = np.arange(len(groups))
+    return rows[~is_test & ~is_val], rows[is_val], rows[is_test]
+
+
 def build_window_index(
     n_accounts: int,
     n_days: int,
@@ -79,8 +93,12 @@ def build_window_index(
     seed: int,
     min_context: int | None = None,
     max_target_day: int | None = None,
+    row_split: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Account-level holdout: validation accounts are never seen in training.
+
+    ``row_split`` = (train rows, validation rows) replaces the random account split, e.g. to split by
+    customer so one customer's cards never sit on both sides.
 
     ``max_target_day`` (inclusive day index) drops every window whose
     supervised horizon would reach past it, for strictly out-of-time
@@ -92,7 +110,12 @@ def build_window_index(
     cuts = np.arange(min_ctx, last_cut + 1, stride)
     if cuts.size == 0:
         raise ValueError(f"need at least {min_ctx + spec.horizon} days of history to train, have {n_days}")
-    val_rows, train_rows = holdout_split(n_accounts, val_fraction, seed)
+    if row_split is not None:
+        train_rows, val_rows = (np.asarray(a, dtype=np.int64) for a in row_split)
+        if np.intersect1d(train_rows, val_rows).size:
+            raise ValueError("row_split: a row is in both train and validation")
+    else:
+        val_rows, train_rows = holdout_split(n_accounts, val_fraction, seed)
 
     def grid(rows: np.ndarray, cut_set: np.ndarray) -> np.ndarray:
         if rows.size == 0:

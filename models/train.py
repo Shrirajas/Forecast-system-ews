@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +37,7 @@ class TrainResult:
     val_median_mape: float
     seconds: float
     device: str
+    meta: dict = field(default_factory=dict)
 
 
 def cpu_profile(m: ModelSettings) -> ModelSettings:
@@ -44,8 +45,9 @@ def cpu_profile(m: ModelSettings) -> ModelSettings:
     return m.model_copy(update=dict(d_model=96, n_layers=2, ff_mult=2, n_heads=4, window_stride=5, num_workers=0))
 
 
-def config_from_settings(m: ModelSettings) -> STFormerConfig:
+def config_from_settings(m: ModelSettings, anchor_last: bool = False, horizon_ramp: bool = False) -> STFormerConfig:
     return STFormerConfig(
+        anchor_last=anchor_last, horizon_ramp=horizon_ramp,
         context_length=m.context_length,
         max_horizon=m.max_horizon,
         patch_length=m.patch_length,
@@ -91,23 +93,29 @@ def train_model(
     quiet: bool = False,
     max_target_day: int | None = None,
     init_checkpoint: Path | None = None,
+    anchor_last: bool = False,
+    horizon_ramp: bool = False,
+    row_split: tuple[np.ndarray, np.ndarray] | None = None,
+    meta: dict | None = None,
 ) -> TrainResult:
     """Train on the cache at ``cache_dir``.
 
     ``max_target_day`` keeps every supervised target on or before that day
     index (out-of-time evaluation); ``init_checkpoint`` warm-starts from a
-    compatible checkpoint (transfer learning / fine-tuning)."""
+    compatible checkpoint (transfer learning / fine-tuning). ``row_split`` = (train rows, validation
+    rows) overrides the random account split (e.g. split by customer); ``meta`` (split rule, cutoff dates,
+    ...) is stored in the checkpoint and its .json so a result can be traced to how it was trained."""
     t0 = time.perf_counter()
     torch.manual_seed(m.seed)
     np.random.seed(m.seed)
     ctx = get_device_context(m.amp_dtype, m.cuda_memory_fraction)
-    cfg = config_from_settings(m)
+    cfg = config_from_settings(m, anchor_last, horizon_ramp)
     spec = WindowSpec(cfg.context_length, cfg.max_horizon, cfg.horizon_pad)
 
     past_shape = np.load(cache_dir / "past.npy", mmap_mode="r").shape
     train_idx, val_idx = build_window_index(
         past_shape[0], past_shape[1], spec, m.window_stride, m.val_fraction, m.seed,
-        max_target_day=max_target_day,
+        max_target_day=max_target_day, row_split=row_split,
     )
     # Drop windows whose account is not yet open at the cutoff or has no target.
     past_mm = np.load(cache_dir / "past.npy", mmap_mode="r")
@@ -125,13 +133,26 @@ def train_model(
         val_idx = val_idx[np.sort(keep)]
     train_ds = CacheWindowDataset(cache_dir, train_idx, spec)
     val_ds = CacheWindowDataset(cache_dir, val_idx, spec)
+    # The logged train loss is a running mean in train mode (dropout on, weights still moving), the check
+    # loss is measured in eval mode: they are not comparable. Re-measure train windows in eval mode, both
+    # on random training windows and on the same recent cutoffs the validation set uses.
+    train_eval_dl = recent_eval_dl = None
+    if len(train_idx) and len(val_idx):
+        rng = np.random.default_rng(m.seed + 1)
+        n_ev = min(MAX_VAL_WINDOWS, len(train_idx))
+        sub = train_idx[np.sort(rng.choice(len(train_idx), n_ev, replace=False))]
+        rec = np.stack([rng.choice(np.unique(train_idx[:, 0]), n_ev), rng.choice(np.unique(val_idx[:, 1]), n_ev)], 1)
+        train_eval_dl = make_loader(CacheWindowDataset(cache_dir, sub, spec), m.batch_size * 2, False, ctx, m.num_workers)
+        rec = observed(rec)
+        if len(rec):
+            recent_eval_dl = make_loader(CacheWindowDataset(cache_dir, rec, spec), m.batch_size * 2, False, ctx, m.num_workers)
     train_dl = make_loader(train_ds, m.batch_size, True, ctx, m.num_workers)
     val_dl = make_loader(val_ds, m.batch_size * 2, False, ctx, m.num_workers) if len(val_ds) else None
 
     model = EWSForecaster(cfg)
     if init_checkpoint is not None:
         blob = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
-        if blob["config"] != cfg.to_dict():
+        if STFormerConfig(**blob["config"]).to_dict() != cfg.to_dict():  # old configs lack newer keys
             raise ValueError("init_checkpoint architecture differs from the training configuration")
         model.load_state_dict(blob["state_dict"])
         log_ = logger.debug if quiet else logger.info
@@ -198,12 +219,17 @@ def train_model(
             if opt_steps >= steps_per_epoch:
                 break
         metrics = evaluate(model, val_dl, ctx, cfg.max_horizon) if val_dl else {"pinball": running / max(seen, 1)}
+        train_eval = {}
+        if train_eval_dl:
+            train_eval["train_pinball_eval"] = evaluate(model, train_eval_dl, ctx, cfg.max_horizon)["pinball"]
+        if recent_eval_dl:
+            train_eval["train_pinball_eval_recent"] = evaluate(model, recent_eval_dl, ctx, cfg.max_horizon)["pinball"]
         log(
             "epoch {}/{} train_pinball={:.4f} val={}",
             epoch + 1, m.epochs, running / max(seen, 1), {k: round(v, 4) for k, v in metrics.items()},
         )
         improved = metrics["pinball"] < best
-        progress["history"].append({"epoch": epoch + 1, "train_pinball": running / max(seen, 1), **metrics,
+        progress["history"].append({"epoch": epoch + 1, "train_pinball": running / max(seen, 1), **train_eval, **metrics,
                                     "saved": improved, "seconds": round(time.perf_counter() - t0, 1)})
         save_progress(epoch=epoch + 1, step=steps_per_epoch)
         if improved:
@@ -217,6 +243,7 @@ def train_model(
                     "epoch": epoch + 1,
                     "trained_at": datetime.now().isoformat(timespec="seconds"),
                     "torch_version": torch.__version__,
+                    "meta": meta or {},
                 },
                 ckpt,
             )
@@ -234,6 +261,7 @@ def train_model(
         val_median_mape=round(best_metrics.get("median_mape", float("nan")), 4),
         seconds=round(time.perf_counter() - t0, 1),
         device=str(ctx.device),
+        meta=meta or {},
     )
     ckpt.with_suffix(".json").write_text(json.dumps(asdict(result), indent=2))
     save_progress(status="done", best_epoch=best_epoch, seconds=result.seconds)

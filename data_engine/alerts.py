@@ -124,6 +124,8 @@ class AlertStore:
         include_acknowledged: bool = False,
         limit: int = 100,
         offset: int = 0,
+        q: str | None = None,
+        product_type: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         where = ["status IN ('ACTIVE', 'ACKNOWLEDGED')" if include_acknowledged else "status = 'ACTIVE'"]
         params: dict[str, Any] = {"mp": min_priority, "lim": limit, "off": offset}
@@ -137,6 +139,12 @@ class AlertStore:
         if rm_id:
             where.append("rm_id = :rm")
             params["rm"] = rm_id
+        if q:  # LIKE with escaped wildcards: a plain substring search on the account id
+            where.append("LOWER(account_id) LIKE :q ESCAPE '\\'")
+            params["q"] = "%" + q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        if product_type:
+            where.append("account_id IN (SELECT account_id FROM accounts WHERE product_type = :pt)")
+            params["pt"] = product_type
         clause = " AND ".join(where)
         total = int(self.storage.scalar(f"SELECT COUNT(*) FROM ews_alerts WHERE {clause}", params) or 0)
         rows = self.storage.query_arrow(
@@ -145,6 +153,20 @@ class AlertStore:
         for i, r in enumerate(rows):
             r["rank"] = offset + i + 1
         return rows, total
+
+    def product_types(self, account_ids: list[str]) -> dict[str, str]:
+        if not account_ids:
+            return {}
+        names = {f"a{i}": a for i, a in enumerate(account_ids)}
+        rows = self.storage.query_arrow(
+            f"SELECT account_id, product_type FROM accounts WHERE account_id IN ({', '.join(':' + k for k in names)})", names
+        ).to_pylist()
+        return {r["account_id"]: r["product_type"] for r in rows}
+
+    def counts(self) -> dict[str, int]:
+        """Alert rows by status: the overview shows ACTIVE; the tables panel counts every run's rows."""
+        rows = self.storage.query_arrow("SELECT status, COUNT(*) AS n FROM ews_alerts GROUP BY status").to_pylist()
+        return {r["status"]: int(r["n"]) for r in rows}
 
     def acknowledge(self, alert_id: str) -> bool:
         exists = self.storage.scalar(

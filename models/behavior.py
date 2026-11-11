@@ -80,3 +80,22 @@ def evaluate_behavior(
         projected_balance_drop=np.where(attrition, drop, 0.0),
         cof_impact_annual=np.where(attrition, drop * cfg.replacement_funding_spread, 0.0),
     )
+
+
+def trend_explanation(trailing: float | None, projected: float | None, change_pct: float | None, horizon: int,
+                      series: str) -> dict:
+    """Name both averages behind a trend label: the forecast mean is NOT compared with today's value."""
+    if trailing is None or projected is None:
+        return {"label": None, "change_pct": None, "forecast_mean": projected, "trailing_mean_90d": trailing,
+                "explanation": "Not enough history to compare."}
+    label = "DECLINING" if change_pct is not None and change_pct <= -10 else (
+        "RISING" if change_pct is not None and change_pct >= 10 else "STABLE")
+    return {
+        "label": label, "change_pct": change_pct, "forecast_mean": projected, "trailing_mean_90d": trailing,
+        "explanation": (f"Mean of the {horizon}-day median forecast of {series} ({projected:,.0f}) vs the mean of the "
+                        f"last 90 days ({trailing:,.0f}); not a comparison with today's value."),
+    }
+
+
+def attrition_label(kind: str, vocab: dict) -> str:
+    return vocab["attrition_label"] if kind == "DEPOSIT_ATTRITION" else vocab["credit_alert_label"]

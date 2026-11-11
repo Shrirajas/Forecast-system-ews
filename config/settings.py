@@ -123,6 +123,10 @@ class RiskSettings(BaseModel):
     undrawn_ccf: float = 0.75
     #: Days of urgency decay used to rank alerts (half weight at this many days).
     urgency_half_life_days: float = 30.0
+    #: False for datasets with no bureau data: the bureau PD term is then dropped, not imputed.
+    bureau_enabled: bool = True
+    #: "High-risk" = a credit product with a projected SMA tier, or PD above this level.
+    high_risk_pd_threshold: float = 0.20
 
 
 class BehaviorSettings(BaseModel):

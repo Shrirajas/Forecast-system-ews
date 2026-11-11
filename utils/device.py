@@ -116,6 +116,14 @@ def get_device_context(
     return ctx
 
 
+def is_cuda_oom(exc: BaseException) -> bool:
+    """CUDA out-of-memory, including cuBLAS/cuDNN handle allocation failures, which surface as a plain
+    RuntimeError (not torch.cuda.OutOfMemoryError) when a shared GPU is nearly full."""
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or (
+        isinstance(exc, RuntimeError) and ("ALLOC_FAILED" in str(exc) or "out of memory" in str(exc).lower())
+    )
+
+
 def run_with_oom_backoff(
     fn: Callable[[int, int], T], n_items: int, batch_size: int, min_batch: int = 1
 ) -> Iterator[T]:
@@ -131,8 +139,8 @@ def run_with_oom_backoff(
         stop = min(n_items, start + bs)
         try:
             out = fn(start, stop)
-        except torch.cuda.OutOfMemoryError:
-            if bs <= min_batch:
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            if not is_cuda_oom(exc) or bs <= min_batch:
                 raise
             torch.cuda.empty_cache()
             bs = max(min_batch, bs // 2)

@@ -46,13 +46,13 @@ def test_predict_contract(client, horizon):
     for acc in body["accounts"]:
         q10, q50, q90 = (acc["forecast"]["balance"][k] for k in ("q10", "q50", "q90"))
         assert all(lo <= mid <= hi for lo, mid, hi in zip(q10, q50, q90, strict=True))
-        if acc["risk_tier"] == "GREEN":
-            assert acc["expected_loss"] is None
-        else:
+        if acc["risk_tier"] != "GREEN":
             assert acc["days_to_breach"] <= horizon
-            assert acc["expected_loss"] == pytest.approx(
-                acc["exposure_at_default"] * acc["probability_of_default"] * acc["loss_given_default"], rel=1e-3
-            )
+        # section 11: expected loss exists for every credit product, GREEN included
+        assert acc["expected_loss"] == pytest.approx(
+            acc["exposure_at_default"] * acc["probability_of_default"] * acc["loss_given_default"], rel=1e-2
+        )
+        assert acc["display"]["expected_loss"]["value"] == acc["expected_loss"]
 
 
 def test_predict_validation(client):

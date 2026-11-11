@@ -31,7 +31,9 @@ GREEN      no shortfall in the horizon
 exposure, taking the larger of today's drawn amount and the asset-track
 (default q90) projected drawn amount at the breach day (or horizon end).
 
-**Expected loss** = EAD x PD x LGD, computed for accounts in an SMA tier.
+**Expected loss** = EAD x PD x LGD, computed for every credit product (credit limit or
+outstanding principal or a scheduled EMI). Debit, prepaid and deposit accounts carry no credit
+exposure: their PD, EAD, LGD and EL are NaN (shown as N/A, never 0).
 """
 
 from __future__ import annotations
@@ -99,10 +101,11 @@ class RiskResult:
     pd_bureau: np.ndarray
     ead: np.ndarray
     lgd: np.ndarray
-    expected_loss: np.ndarray  # NaN for GREEN
+    expected_loss: np.ndarray  # NaN for non-credit products
     priority: np.ndarray
     util_breach_day: np.ndarray  # int [B], -1 = none
     triggers: list[list[str]]
+    credit_product: np.ndarray | None = None  # bool [B]
 
 
 def _first_true(mask: np.ndarray) -> np.ndarray:
@@ -149,16 +152,21 @@ def evaluate_risk(
     pd_cash = np.where(due, p_short, 0.0).max(-1)
     p_util = (1.0 - quantile_cdf(q_util, np.full((b, h), cfg.utilization_breach))).max(-1)
     pd_bureau = 1.0 / (1.0 + np.exp((snap.cibil - cfg.bureau_midpoint) / cfg.bureau_scale))
-    pd = 1.0 - (1.0 - pd_cash) * (1.0 - cfg.util_pd_weight * p_util) * (1.0 - cfg.bureau_pd_weight * pd_bureau)
+    if not cfg.bureau_enabled:  # no bureau data in this dataset: drop the term instead of imputing a score
+        pd_bureau = np.full(b, np.nan)
+    pd = 1.0 - (1.0 - pd_cash) * (1.0 - cfg.util_pd_weight * p_util) * (
+        1.0 - cfg.bureau_pd_weight * np.nan_to_num(pd_bureau)
+    )
     pd = np.clip(pd, 0.0, 1.0)
+    credit = (snap.credit_limit > 0) | (snap.outstanding_principal > 0) | due.any(-1)
 
     ead_idx = np.where(dtb > 0, dtb - 1, h - 1)
     proj_util = np.clip(q_util[np.arange(b), ead_idx, ai], 0.0, None)
     drawn_now = np.clip(snap.current_utilization, 0.0, None) * snap.credit_limit
     ead = snap.outstanding_principal + np.maximum(drawn_now, proj_util * snap.credit_limit)
     lgd = np.clip(snap.lgd, 0.0, 1.0)
-    in_sma = tier != "GREEN"
-    el = np.where(in_sma, ead * pd * lgd, np.nan)
+    el = np.where(credit, ead * pd * lgd, np.nan)
+    pd, ead, lgd = (np.where(credit, x, np.nan) for x in (pd, ead, lgd))
 
     dtz = _first_true(q_bal[..., li] <= cfg.zero_balance_threshold)
     next_emi_day = _first_true(due)
@@ -167,7 +175,7 @@ def evaluate_risk(
 
     urgency_days = np.where(dtz > 0, np.minimum(dtz, np.where(dtb > 0, dtb, dtz)), dtb).astype(float)
     urgency = np.power(0.5, np.clip(urgency_days, 0, None) / cfg.urgency_half_life_days)
-    priority = np.where(in_sma, np.nan_to_num(el) * urgency, 0.0)
+    priority = np.where(credit, np.nan_to_num(el) * urgency, 0.0)
 
     triggers: list[list[str]] = []
     qname = f"q{int(round(QUANTILES[li] * 100))}"
@@ -204,4 +212,73 @@ def evaluate_risk(
         priority=priority,
         util_breach_day=util_breach_day,
         triggers=triggers,
+        credit_product=credit,
     )
+
+
+# ------------------------------------------------------------------------------ display vocabulary
+TIER_TOOLTIP = (
+    "Projected SMA is a forecast of a missed EMI. RBI SMA status is based on days already overdue, "
+    "so this is not a regulatory classification."
+)
+GREEN_NOTE = "No shortfall projected in the horizon. This is not a guarantee of low credit risk."
+PD_BASIS_FULL = "forecast cash-shortfall + utilisation + bureau drivers"
+PD_BASIS_BUREAU = "bureau-based estimate, not calibrated"
+NON_CREDIT_REASON = "No credit exposure: debit, prepaid and deposit accounts have no EAD, LGD or expected loss."
+
+
+def monotone_quantiles(q: np.ndarray) -> tuple[np.ndarray, int]:
+    """Enforce q10 <= ... <= q90 along the last axis by sorting; returns (sorted, rows that were crossed)."""
+    q = np.asarray(q)
+    out = np.sort(q, axis=-1)
+    return out, int((out != q).any(-1).sum())
+
+
+def tier_label(tier: str) -> str:
+    return "No projected shortfall" if tier == "GREEN" else f"Projected {tier}"
+
+
+def pd_display(pd, cash, util, bureau, cfg: RiskSettings, bureau_name: str | None) -> dict:
+    """PD with its three drivers. Components are None where the account/dataset has no such input."""
+    def f(x):
+        return None if x is None or not np.isfinite(x) else float(x)
+
+    comps = [
+        {"id": "cash_shortfall", "label": "Cash shortfall vs scheduled EMIs", "value": f(cash), "weight": 1.0},
+        {"id": "utilization_breach", "label": f"Credit-line use above {cfg.utilization_breach:.0%}", "value": f(util),
+         "weight": cfg.util_pd_weight},
+        {"id": "bureau", "label": f"{bureau_name or 'Bureau'} score (logistic)", "value": f(bureau),
+         "weight": cfg.bureau_pd_weight},
+    ]
+    for c in comps:
+        c["contribution"] = None if c["value"] is None else round(c["value"] * c["weight"], 4)
+    forecast_part = (comps[0]["contribution"] or 0.0) + (comps[1]["contribution"] or 0.0)
+    bureau_part = comps[2]["contribution"] or 0.0
+    # "bureau-based" when the bureau term outweighs the forecast-driven terms (every card without EMIs)
+    basis = PD_BASIS_BUREAU if comps[2]["value"] is not None and bureau_part >= forecast_part else PD_BASIS_FULL
+    return {"value": f(pd), "calibrated": False, "bureau_name": bureau_name, "components": comps, "basis": basis}
+
+
+def trigger_info(code: str, vocab: dict) -> dict:
+    """Readable label for one trigger code. ``vocab`` is the dataset's label set (see config.registry)."""
+    head, _, day = code.rpartition("_DAY_")
+    if code.startswith("CASH_TO_ZERO_DAY_"):
+        n = code.rsplit("_", 1)[1]
+        return {"code": code, "label": vocab["zero_floor_label"].format(day=n), "detail": vocab["zero_floor_detail"]}
+    if code.startswith("EMI_SHORTFALL_"):
+        return {"code": code, "label": f"Projected EMI shortfall on day {day}", "detail": f"Bad-case track ({head.rsplit('_', 1)[-1]})."}
+    if code.startswith("UTILIZATION_SPIKE_DAY_"):
+        return {"code": code, "label": f"Utilisation above limit on day {day}", "detail": None}
+    if code == "RECENT_PAYMENT_RETURN":
+        return {"code": code, "label": vocab["return_label"], "detail": vocab["return_detail"]}
+    if code == "MISSED_SALARY":
+        return {"code": code, "label": "Expected income missed", "detail": None}
+    if code.startswith("BUREAU_DROP_"):
+        return {"code": code, "label": f"{vocab.get('bureau_name') or 'Bureau'} score dropped {code[12:-3]} points", "detail": None}
+    return {"code": code, "label": code, "detail": None}
+
+
+def money_na(value, reason: str | None = None) -> dict:
+    """{value, na_reason}: a missing number is N/A with a reason, never zero."""
+    ok = value is not None and np.isfinite(value)
+    return {"value": float(value) if ok else None, "na_reason": None if ok else (reason or NON_CREDIT_REASON)}

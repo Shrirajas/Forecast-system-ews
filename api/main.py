@@ -23,7 +23,9 @@ from api import connection
 from api.broker import AlertBroker
 from api.deps import Services
 from api.jobs import JobManager
-from api.routes import alerts, console, ingest, predict, system
+from api.routes import alerts, compare, console, datasets, forecast, ingest, predict, system
+from api.runtime import Runtime
+from config.registry import REGISTRY, DatasetSpec, match_dataset
 from config.settings import Settings, get_settings
 from data_engine.ingestion import IngestionEngine
 from data_engine.storage import get_storage
@@ -48,7 +50,7 @@ def _warm(pipeline: EWSPipeline) -> None:
         logger.warning("warm-up incomplete: {}", exc)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, registry: dict[str, DatasetSpec] | None = None) -> FastAPI:
     settings = connection.load_saved(settings or get_settings())
     setup_logging(settings.log_level)
 
@@ -64,7 +66,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ingestion=IngestionEngine(storage, batch_rows=settings.storage.stream_batch_rows),
             broker=AlertBroker(),
             jobs=JobManager(),
+            dataset_id=match_dataset(settings, registry if registry is not None else REGISTRY),
         )
+        app.state.runtime.base = settings
         if settings.warm_cache_on_startup:
             await run_in_threadpool(_warm, pipeline)
         logger.info("{} ready (storage={}, model={})", settings.app_name, settings.storage.backend, settings.model.backend)
@@ -80,8 +84,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
-    for r in (system.router, ingest.router, predict.router, alerts.router, console.router):
+    for r in (system.router, ingest.router, predict.router, alerts.router, console.router, datasets.router, forecast.router, compare.router):
         app.include_router(r)
+    app.state.runtime = Runtime(app, registry)
     # Web console: connect a database, import data, run jobs, browse alerts and forecasts.
     app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 

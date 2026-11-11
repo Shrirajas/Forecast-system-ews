@@ -1,7 +1,7 @@
 # EWS console upgrade: Phase 1 plan
 
 Branch `different-approach` (baseline `b58eb6a`). Written by the backend lead from a read of the code, with input from ML,
-UI/UX and QA collected in the team chat. API shapes: `.team/ews/API_CONTRACT.md`, copied into section 6 when the code lands.
+UI/UX and QA collected in the team chat. API shapes: `.team/ews/API_CONTRACT.md`, copied into the final report when the code lands.
 
 ## 1. Inspection findings (verified in code, not from the docs)
 

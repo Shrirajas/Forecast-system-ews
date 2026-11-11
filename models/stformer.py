@@ -50,6 +50,12 @@ class STFormerConfig:
     ff_mult: int = 4
     dropout: float = 0.1
     quantiles: list[float] = field(default_factory=lambda: list(QUANTILES))
+    #: Normalise balance/utilisation around the LAST observed value instead of the context mean, so the
+    #: forecast starts at today's level. Off by default: checkpoints trained without it must keep working.
+    anchor_last: bool = False
+    #: With anchor_last: scale the forecast offsets (from today's level) by sqrt(day / horizon_pad), so the
+    #: first days start at today's value. The network can still learn large offsets for later days.
+    horizon_ramp: bool = False
 
     @property
     def horizon_pad(self) -> int:
@@ -218,6 +224,12 @@ class EWSForecaster(nn.Module):
         std = torch.maximum(torch.sqrt(var).clamp_min(floor_abs), floor_rel * mean_abs)
         return mean, std
 
+    @staticmethod
+    def _last_obs(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        """Last observed value along time (0 where nothing was observed)."""
+        idx = (m * torch.arange(1, x.shape[1] + 1, device=x.device)).argmax(1)
+        return x.gather(1, idx[:, None])[:, 0] * (m.sum(1) > 0)
+
     def _prepare(self, past: torch.Tensor, known: torch.Tensor):
         with torch.autocast(device_type=past.device.type, enabled=False):
             past = past.float()
@@ -226,6 +238,9 @@ class EWSForecaster(nn.Module):
             x = torch.nan_to_num(past, nan=0.0)
             bal_loc, bal_scale = self._masked_stats(x[..., BAL], mask[..., BAL], 1.0, 0.01)
             util_loc, util_scale = self._masked_stats(x[..., UTIL], mask[..., UTIL], 0.05, 0.0)
+            if self.cfg.anchor_last:  # scale still comes from the whole context; only the level moves
+                bal_loc = self._last_obs(x[..., BAL], mask[..., BAL])
+                util_loc = self._last_obs(x[..., UTIL], mask[..., UTIL])
             s = Scaling(bal_loc, bal_scale, util_loc, util_scale)
             bs, bl = bal_scale[:, None], bal_loc[:, None]
             xn = torch.stack(
@@ -258,7 +273,12 @@ class EWSForecaster(nn.Module):
 
     def forward_normalized(self, past: torch.Tensor, known: torch.Tensor):
         xn, mask, kn, static, s = self._prepare(past, known)
-        return self.net(xn, mask, kn, static), s
+        qn = self.net(xn, mask, kn, static)
+        if self.cfg.anchor_last and self.cfg.horizon_ramp:
+            hp = qn.shape[2]
+            ramp = torch.sqrt(torch.arange(1, hp + 1, device=qn.device, dtype=qn.dtype) / hp)
+            qn = qn * ramp[None, None, :, None]  # positive scale: quantile order is preserved
+        return qn, s
 
     def forward(self, past: torch.Tensor, known: torch.Tensor) -> torch.Tensor:
         """Raw ``past [B,L,6]`` (NaN = missing), ``known [B,L+Hp,3]`` -> raw quantiles ``[B,2,Hp,Q]``."""
