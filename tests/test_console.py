@@ -157,3 +157,12 @@ def test_jobs_and_remote_guard(console, env):
     remote = TestClient(console.app, client=("203.0.113.9", 5000))
     assert remote.get("/api/v1/console/overview").status_code == 403
     assert remote.get("/health").status_code == 200  # the normal API is unaffected
+
+
+def test_training_progress_endpoint(console, env):
+    settings, _ = env
+    p = console.get("/api/v1/console/training").json()
+    assert p["status"] == "done" and p["steps_per_epoch"] == 3
+    assert [r["epoch"] for r in p["history"]] == list(range(1, settings.model.epochs + 1))
+    assert p["history"][0]["saved"] and p["checkpoint"] == str(settings.model.checkpoint_path)
+    assert {"train_pinball", "pinball", "coverage_10_90", "median_mape"} <= set(p["history"][-1])

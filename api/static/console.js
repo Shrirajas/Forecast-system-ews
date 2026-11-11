@@ -52,10 +52,23 @@ function kv(target, pairs) {
   box.replaceChildren(...pairs.flatMap(([k, v]) => [el("div", { class: "k" }, k), el("div", { class: "v" }, fmt.str(v))]));
 }
 
+// Plain-English meaning of column headers; shown on hover (dotted underline).
+const HELP = {
+  priority: "Ranking score: expected loss weighted by how soon the problem is due. Highest first.",
+  PD: "Probability of default: chance an EMI bounces within the horizon.",
+  EAD: "Exposure at default: amount at risk if it does default.",
+  "expected loss": "PD × EAD × loss rate: the loss to provision for.",
+  "breach day": "Days until the balance is likely too low to cover an EMI.",
+  "zero day": "Days until the balance is likely to hit (near) zero.",
+  type: "CREDIT_EWS = loan repayment at risk. DEPOSIT_ATTRITION = balance/spend projected to fall sharply (customer may leave).",
+  tier: "GREEN = fine; SMA-0 / SMA-1 / SMA-2 = special-mention account, rising severity.",
+  RM: "Relationship manager / territory the account belongs to.",
+};
+
 function table(target, headers, rows) {
   const t = $(target);
   t.replaceChildren(
-    el("thead", {}, el("tr", {}, headers.map((h) => el("th", {}, h)))),
+    el("thead", {}, el("tr", {}, headers.map((h) => el("th", HELP[h] ? { title: HELP[h], class: "has-help" } : {}, h)))),
     el("tbody", {}, rows.length ? rows : [el("tr", {}, el("td", { colspan: headers.length, class: "muted" }, "Nothing yet."))]),
   );
 }
@@ -70,6 +83,8 @@ function showTab(name) {
   if (name === "database") loadConnection();
   if (name === "jobs") loadJobs();
   if (name === "alerts") loadAlerts();
+  if (name === "forecast") loadAccountList();
+  if (name === "training") loadTraining();
 }
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 
@@ -326,6 +341,7 @@ async function loadAlerts() {
   if ($("#al-tier").value) q.set("tier", $("#al-tier").value);
   try {
     const r = await api("/api/v1/alerts/active?" + q);
+    fillAccountList(r.alerts);
     table("#alerts-table", ["#", "account", "RM", "type", "tier", "priority", "PD", "EAD", "expected loss",
       "breach day", "zero day", "next EMI", "triggers"],
     r.alerts.map((a) => el("tr", {},
@@ -344,6 +360,17 @@ $("#al-tier").addEventListener("change", loadAlerts);
 
 // ------------------------------------------------------------------------------ forecast
 function openForecast(id) { $("#fc-account").value = id; showTab("forecast"); runForecast(); }
+
+// Suggest alerted accounts in the account box so nobody has to guess an id.
+function fillAccountList(alerts) {
+  const seen = new Set();
+  $("#fc-accounts").replaceChildren(...alerts.filter((a) => !seen.has(a.account_id) && seen.add(a.account_id))
+    .map((a) => el("option", { value: a.account_id }, `${a.risk_tier} · ${a.alert_type}`)));
+}
+async function loadAccountList() {
+  if ($("#fc-accounts").children.length) return;
+  try { fillAccountList((await api("/api/v1/alerts/active?limit=200")).alerts); } catch (_) { /* optional */ }
+}
 $("#fc-go").addEventListener("click", runForecast);
 $("#fc-account").addEventListener("keydown", (e) => { if (e.key === "Enter") runForecast(); });
 
@@ -358,20 +385,25 @@ async function runForecast() {
     if (!r.accounts.length) { toast(`Unknown account ${id}`); return; }
     const a = r.accounts[0];
     const cards = [
-      ["Tier", tierBadge(a.risk_tier)], ["Balance today", fmt.num(a.current_balance)],
-      ["Next EMI", a.next_emi ? `${fmt.num(a.next_emi.amount)} on ${a.next_emi.date}` : "–"],
-      ["Days to breach", fmt.str(a.days_to_breach)], ["PD", fmt.pct(a.probability_of_default)],
-      ["EAD", fmt.num(a.exposure_at_default)], ["Expected loss", fmt.num(a.expected_loss)],
-      ["Trend", `${a.behavior.trend} (${fmt.num(a.behavior.projected_change_pct, 1)}%)`],
+      ["Tier", tierBadge(a.risk_tier), "Risk bucket: GREEN = fine; SMA-0/1/2 = special-mention account, rising severity."],
+      ["Balance today", fmt.num(a.current_balance), "Latest end-of-day balance."],
+      ["Next EMI", a.next_emi ? `${fmt.num(a.next_emi.amount)} on ${a.next_emi.date}` : "–", "Next loan instalment due on this account."],
+      ["Days to breach", fmt.str(a.days_to_breach), "Days until the balance is likely too low to cover an EMI."],
+      ["PD", fmt.pct(a.probability_of_default), "Probability of default: chance an EMI bounces within the horizon."],
+      ["EAD", fmt.num(a.exposure_at_default), "Exposure at default: amount at risk if it does default."],
+      ["Expected loss", fmt.num(a.expected_loss), "PD × EAD × loss rate: the loss to provision for."],
+      ["Trend", `${a.behavior.trend} (${fmt.num(a.behavior.projected_change_pct, 1)}%)`, "Projected change in balance over the horizon."],
     ];
-    $("#fc-summary").replaceChildren(...cards.map(([k, v]) => el("div", { class: "card" }, el("div", { class: "muted" }, k), el("div", {}, v))));
+    $("#fc-summary").replaceChildren(...cards.map(([k, v, tip]) => el("div", { class: "card", title: tip },
+      el("div", { class: "muted" }, k, el("span", { class: "q", "aria-label": tip }, "?")), el("div", { class: "big" }, v))));
     $("#fc-triggers").replaceChildren(...(a.triggers.length ? a.triggers : ["no triggers"]).map((t) => el("span", { class: "chip" }, t)));
-    drawChart(a.forecast);
+    $("#fc-empty").classList.add("hidden");
+    drawChart(a.forecast, /CARD$/.test(a.product_type || "") ? "30-day spend" : "balance");
   } catch (e) { toast(e.message); }
 }
 
-function drawChart(f) {
-  const W = 960, H = 320, L = 70, R = 16, T = 16, B = 34;
+function drawChart(f, what = "balance") {
+  const W = 960, H = 320, L = 88, R = 16, T = 16, B = 34;
   const n = f.dates.length, lo = f.balance.q10, md = f.balance.q50, hi = f.balance.q90;
   const emis = f.emi_schedule.map((e) => ({ i: f.dates.indexOf(e.date), amt: e.amount })).filter((e) => e.i >= 0);
   const ymin = Math.min(0, ...lo), ymax = Math.max(...hi, ...emis.map((e) => e.amt), 1);
@@ -398,10 +430,121 @@ function drawChart(f) {
     svg.append(s("line", { class: "emi-line", x1: x(e.i), x2: x(e.i), y1: T, y2: H - B }),
       s("circle", { class: "emi", cx: x(e.i), cy: y(e.amt), r: 4 }, undefined));
   }
-  [[0, "start"], [Math.floor((n - 1) / 2), "middle"], [n - 1, "end"]].forEach(([i, anchor]) =>
+  [[0, "start"], [Math.floor((n - 1) / 4), "middle"], [Math.floor((n - 1) / 2), "middle"],
+   [Math.floor(3 * (n - 1) / 4), "middle"], [n - 1, "end"]].forEach(([i, anchor]) =>
     svg.append(s("text", { x: x(i), y: H - 10, "text-anchor": anchor }, f.dates[i])));
-  const legend = el("p", { class: "hint" }, "Shaded: q10–q90 band · solid: median (q50) · dashed red: worst-case q10 track · orange: EMI due (amount).");
-  $("#fc-chart").replaceChildren(svg, legend);
+  svg.append(s("text", { x: 12, y: T + (H - T - B) / 2, "text-anchor": "middle", transform: `rotate(-90 12 ${T + (H - T - B) / 2})` }, what[0].toUpperCase() + what.slice(1)));
+
+  // hover: guide line + tooltip for the nearest day
+  const guide = s("line", { class: "guide hidden", y1: T, y2: H - B });
+  svg.append(guide);
+  const tip = el("div", { class: "tip hidden" });
+  const emiOn = Object.fromEntries(emis.map((e) => [e.i, e.amt]));
+  svg.addEventListener("mousemove", (ev) => {
+    const vx = (ev.offsetX / svg.clientWidth) * W;
+    const i = Math.max(0, Math.min(n - 1, Math.round(((vx - L) / (W - L - R)) * (n - 1))));
+    guide.setAttribute("x1", x(i)); guide.setAttribute("x2", x(i)); guide.classList.remove("hidden");
+    tip.replaceChildren(el("b", {}, f.dates[i]),
+      el("div", {}, `Expected: ${fmt.num(md[i])}`),
+      el("div", {}, `Likely range: ${fmt.num(lo[i])} – ${fmt.num(hi[i])}`),
+      ...(i in emiOn ? [el("div", { class: "tip-emi" }, `EMI due: ${fmt.num(emiOn[i])}`)] : []),
+      ...(lo[i] < (emiOn[i] ?? 0) ? [el("div", { class: "tip-bad" }, "Risk: low case can't cover the EMI")] : []));
+    tip.style.left = `${Math.min(ev.offsetX + 14, svg.clientWidth - 220)}px`;
+    tip.style.top = `${ev.offsetY + 10}px`;
+    tip.classList.remove("hidden");
+  });
+  svg.addEventListener("mouseleave", () => { guide.classList.add("hidden"); tip.classList.add("hidden"); });
+
+  const key = (cls, label, desc) => el("div", { class: "key" }, el("span", { class: `sw ${cls}` }), el("b", {}, label), el("span", { class: "muted" }, desc));
+  const legend = el("div", { class: "legend" },
+    key("sw-med", `Expected ${what}`, "most likely path (median)"),
+    key("sw-band", "Likely range", `80% chance the ${what} stays inside`),
+    key("sw-low", "Bad case", "only 10% chance of being lower"),
+    ...(emis.length ? [key("sw-emi", "EMI due", "dot height = instalment amount")] : []),
+    ...(ymin < 0 ? [key("sw-zero", "Zero", what === "balance" ? "below = overdrawn" : "below = more refunds than spend")] : []));
+  const last = n - 1;
+  const read = el("p", { class: "hint" }, `By ${f.dates[last]} the ${what} is expected to be about ${fmt.num(md[last])}, ` +
+    `likely between ${fmt.num(lo[last])} and ${fmt.num(hi[last])}. ` +
+    (emis.length ? "Where the red dashed line drops below an orange dot, the account may not cover that EMI. "
+      : what === "balance" ? "" : "A falling line means the customer is using the card less. ") +
+    "Hover the chart for daily values.");
+  $("#fc-chart").replaceChildren(legend, svg, tip, read);
+}
+
+// ------------------------------------------------------------------------------ training
+const NS_SVG = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs, text) {
+  const e = document.createElementNS(NS_SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+$("#tr-go").addEventListener("click", (ev) => withButton(ev.target, async () => {
+  const steps = $("#tr-steps").value.trim();
+  const r = await post("/api/v1/jobs/train", { epochs: Number($("#tr-epochs").value || 6), ...(steps ? { steps_per_epoch: Number(steps) } : {}) });
+  toast(`Started: ${r.job.description}`);
+  watchJobs();
+  setTimeout(loadTraining, 800);
+}).catch((e) => toast(e.message)));
+
+async function loadTraining() {
+  clearTimeout(loadTraining._t);
+  let p;
+  try { p = await api("/api/v1/console/training"); } catch (e) { toast(e.message); return; }
+  if (p.status === "none") {
+    $("#tr-status").replaceChildren(el("p", { class: "hint" }, `No training run recorded yet. The model will be saved to ${p.checkpoint}`));
+    $("#tr-fill").style.width = "0%"; $("#tr-chart").replaceChildren(); $("#tr-table").replaceChildren();
+    return;
+  }
+  const h = p.history || [], spe = p.steps_per_epoch || 1;
+  const doneSteps = h.length * spe + (p.status === "running" && p.epoch > h.length ? p.step : 0);
+  const pct = p.status === "done" ? 100 : Math.min(100, (100 * doneSteps) / (p.epochs * spe));
+  $("#tr-fill").style.width = `${pct.toFixed(1)}%`;
+  $("#tr-fill").className = `fill ${p.status}`;
+  const best = h.filter((r) => r.saved).pop();
+  $("#tr-status").replaceChildren(el("div", { class: "kv" }, ...[
+    ["status", p.status === "running" ? `running · epoch ${p.epoch}/${p.epochs} · step ${p.step}/${spe}` : p.status + (p.error ? `: ${p.error}` : "")],
+    ["progress", `${pct.toFixed(0)}%`], ["device", p.device],
+    ["data", `${fmt.num(p.train_windows)} training windows · ${fmt.num(p.val_windows)} check windows · batch ${p.batch_size}`],
+    ["model size", `${fmt.num(p.params)} weights`],
+    ["best so far", best ? `epoch ${best.epoch}: error ${best.pinball.toFixed(4)}, ${(100 * best.coverage_10_90).toFixed(1)}% inside band` : "–"],
+    ["saved to", p.checkpoint],
+  ].flatMap(([k, v]) => [el("div", { class: "k" }, k), el("div", { class: "v" }, v)])));
+  drawTrainChart(h, p.epochs);
+  table("#tr-table", ["epoch", "train error", "check error", "inside band", "typical miss", "saved", "elapsed"],
+    h.map((r) => el("tr", {}, el("td", { class: "num" }, r.epoch), el("td", { class: "num" }, r.train_pinball.toFixed(4)),
+      el("td", { class: "num" }, r.pinball.toFixed(4)), el("td", { class: "num" }, fmt.pct(r.coverage_10_90)),
+      el("td", { class: "num" }, fmt.pct(r.median_mape)), el("td", {}, r.saved ? "✓" : ""), el("td", { class: "num" }, `${r.seconds}s`))));
+  if (p.status === "running" && $("#tab-training").classList.contains("active")) loadTraining._t = setTimeout(loadTraining, 1500);
+}
+
+function drawTrainChart(h, epochs) {
+  if (!h.length) { $("#tr-chart").replaceChildren(el("p", { class: "hint" }, "Waiting for the first epoch to finish…")); return; }
+  const W = 960, H = 260, L = 64, R = 16, T = 14, B = 34;
+  const vals = h.flatMap((r) => [r.train_pinball, r.pinball]);
+  const lo = Math.min(...vals) * 0.95, hi = Math.max(...vals) * 1.05;
+  const n = Math.max(epochs, 2);
+  const x = (e) => L + ((e - 1) / (n - 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo || 1)) * (H - T - B);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "training error per epoch" });
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (k / 4) * (hi - lo);
+    svg.append(svgEl("line", { class: "axis", x1: L, x2: W - R, y1: y(v), y2: y(v) }),
+      svgEl("text", { x: L - 8, y: y(v) + 4, "text-anchor": "end" }, v.toFixed(3)));
+  }
+  for (let e = 1; e <= epochs; e++) svg.append(svgEl("text", { x: x(e), y: H - 10, "text-anchor": "middle" }, `ep ${e}`));
+  const line = (key, cls) => svgEl("path", { class: cls, d: h.map((r, i) => `${i ? "L" : "M"}${x(r.epoch)},${y(r[key])}`).join("") });
+  svg.append(line("train_pinball", "tr-train"), line("pinball", "med"));
+  for (const r of h) {
+    svg.append(svgEl("circle", { class: "tr-dot", cx: x(r.epoch), cy: y(r.pinball), r: r.saved ? 5 : 3 }));
+    if (r.saved) svg.append(svgEl("text", { x: x(r.epoch), y: y(r.pinball) - 9, "text-anchor": "middle", class: "tr-saved" }, "✓"));
+  }
+  const key = (cls, label, desc) => el("div", { class: "key" }, el("span", { class: `sw ${cls}` }), el("b", {}, label), el("span", { class: "muted" }, desc));
+  $("#tr-chart").replaceChildren(el("div", { class: "legend" },
+    key("sw-med", "Check error", "on accounts it never trained on: this is what matters"),
+    key("sw-train", "Training error", "on the data it learns from"),
+    el("div", { class: "key" }, el("b", {}, "✓"), el("span", { class: "muted" }, "weights saved (best so far)"))), svg);
 }
 
 // ------------------------------------------------------------------------------ boot

@@ -8,6 +8,7 @@ before you do that).
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import uuid
 from pathlib import Path
@@ -308,6 +309,16 @@ async def get_job(job_id: str, svc: Svc) -> dict[str, Any]:
 
 class TrainRequest(BaseModel):
     epochs: int = Field(6, ge=1, le=200)
+    #: Cap optimiser steps per epoch so a large book trains in minutes (None = every window).
+    steps_per_epoch: int | None = Field(None, ge=1, le=100_000)
+
+
+@router.get("/console/training", summary="Live progress of the current / last training run")
+async def training_progress(svc: Svc) -> dict[str, Any]:
+    path = Path(svc.settings.model.checkpoint_path).with_suffix(".progress.json")
+    if not path.exists():
+        return {"status": "none", "checkpoint": str(svc.settings.model.checkpoint_path)}
+    return json.loads(path.read_text())
 
 
 @router.post("/jobs/{kind}", summary="Start a background job: refresh, score-book or train")
@@ -321,13 +332,21 @@ async def start_job(
     elif kind == "score-book":
         job = svc.jobs.submit("score-book", "Score the whole book (30/60/90 days)", lambda: p.score_book(force=True))
     else:
-        epochs = (train or TrainRequest()).epochs
+        req = train or TrainRequest()
+        epochs = req.epochs
 
         def do_train() -> dict[str, Any]:
             p.refresh()
             m = settings.model if torch.cuda.is_available() else cpu_profile(settings.model)
             m = m.model_copy(update={"epochs": epochs})
-            result = train_model(p.cache.current_dir(), m, checkpoint_path=settings.model.checkpoint_path)
+            try:
+                result = train_model(p.cache.current_dir(), m, checkpoint_path=settings.model.checkpoint_path,
+                                     max_steps_per_epoch=req.steps_per_epoch)
+            except Exception as e:
+                prog = Path(settings.model.checkpoint_path).with_suffix(".progress.json")
+                if prog.exists():  # tell the Training tab instead of leaving it on "running"
+                    prog.write_text(json.dumps({**json.loads(prog.read_text()), "status": "failed", "error": str(e)}))
+                raise
             reset_engine()
             p._engine = None  # pick up the new weights
             return {"training": result.__dict__, "book": p.score_book(force=True)}

@@ -85,6 +85,29 @@ a.acct { color: var(--accent); cursor: pointer; text-decoration: underline; }
 .chart .low { fill: none; stroke: var(--bad); stroke-width: 1.2; stroke-dasharray: 4 3; }
 .chart .zero { stroke: var(--muted); stroke-dasharray: 2 3; } .chart .emi { fill: var(--warn); }
 .chart .emi-line { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 2 2; }
+.chart { position: relative; }
+.chart .guide { stroke: var(--muted); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 4px 0 10px; font-size: 12.5px; }
+.legend .key { display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; width: 22px; height: 12px; border-radius: 3px; }
+.sw-med { height: 0; border-top: 2px solid var(--accent); border-radius: 0; }
+.sw-band { background: var(--band); border: 1px solid var(--line); }
+.sw-low { height: 0; border-top: 2px dashed var(--bad); border-radius: 0; }
+.sw-emi { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); }
+.sw-zero { height: 0; border-top: 2px dotted var(--muted); border-radius: 0; }
+.tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+       border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.15); min-width: 190px; }
+.tip-emi { color: var(--warn); } .tip-bad { color: var(--bad); font-weight: 600; }
+.q { display: inline-block; margin-left: 6px; width: 15px; height: 15px; line-height: 15px; text-align: center;
+     border-radius: 50%; border: 1px solid var(--line); font-size: 10px; cursor: help; }
+.big { font-size: 18px; font-weight: 600; margin-top: 2px; }
 .toast { position: fixed; bottom: 20px; right: 20px; max-width: 420px; background: var(--ink); color: var(--bg);
          padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.2); white-space: pre-wrap; }
 @media (max-width: 640px) { main, .top, .tabs { padding-left: 16px; padding-right: 16px; } .field { min-width: 100%; } }
+th.has-help { cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
+.bar { height: 10px; background: var(--line); border-radius: 999px; overflow: hidden; margin: 10px 0 6px; }
+.bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .6s ease; }
+.bar .fill.done { background: var(--ok); } .bar .fill.failed { background: var(--bad); }
+.chart .tr-train { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.chart .tr-dot { fill: var(--accent); } .chart .tr-saved { fill: var(--ok); font-size: 13px; font-weight: 700; }
+.sw-train { height: 0; border-top: 2px dashed var(--muted); border-radius: 0; }

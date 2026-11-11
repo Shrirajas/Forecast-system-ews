@@ -19,6 +19,7 @@
   <button data-tab="jobs">Jobs <span id="jobs-badge" class="pill hidden"></span></button>
   <button data-tab="alerts">Alerts</button>
   <button data-tab="forecast">Account forecast</button>
+  <button data-tab="training">Training</button>
   <a class="docs" href="/docs" target="_blank" rel="noopener">API docs ↗</a>
 </nav>
 
@@ -171,7 +172,11 @@
         <button id="al-reload">Reload</button>
       </div>
       <div class="table-wrap"><table id="alerts-table"></table></div>
-      <p class="hint">Click an account to see its forecast.</p>
+      <p class="hint">Click an account to see its forecast. Hover a column header with a dotted underline for its meaning.
+        <b>CREDIT_EWS</b>: a loan repayment (EMI) is at risk. <b>DEPOSIT_ATTRITION</b>: balance or spend is projected
+        to fall sharply, so the customer may be leaving. Tiers: <span class="tier GREEN">GREEN</span> fine,
+        <span class="tier SMA-0">SMA-0</span> <span class="tier SMA-1">SMA-1</span> <span class="tier SMA-2">SMA-2</span>
+        special-mention accounts, rising severity.</p>
     </div>
   </section>
 
@@ -179,14 +184,37 @@
   <section id="tab-forecast" class="tab">
     <div class="card">
       <div class="row">
-        <div class="field"><label for="fc-account">Account id</label><input id="fc-account" placeholder="AC00000018"></div>
+        <div class="field"><label for="fc-account">Account id</label><input id="fc-account" list="fc-accounts" placeholder="pick or type an account"><datalist id="fc-accounts"></datalist></div>
         <div class="field"><label for="fc-h">Horizon</label>
           <select id="fc-h"><option>30</option><option>60</option><option selected>90</option></select></div>
         <div class="actions end"><button id="fc-go" class="primary">Forecast</button></div>
       </div>
+      <p id="fc-empty" class="hint">Pick an account (the list shows accounts with active alerts) or click one in the
+        <b>Alerts</b> tab. You get its forecast for the next 30/60/90 days with a likely range, plus its risk numbers.
+        Hover anything with a <span class="q">?</span> or a dotted underline for an explanation.</p>
       <div id="fc-summary" class="grid4"></div>
       <div id="fc-chart" class="chart"></div>
       <div id="fc-triggers" class="chips"></div>
+    </div>
+  </section>
+  <!-- TRAINING -->
+  <section id="tab-training" class="tab">
+    <div class="card">
+      <div class="row">
+        <h3 class="grow">Train the forecaster</h3>
+        <label class="inline">epochs <input id="tr-epochs" type="number" min="1" max="200" value="6"></label>
+        <label class="inline">steps per epoch <input id="tr-steps" type="number" min="1" max="100000" value="300"
+          title="Batches per epoch. Smaller = faster epochs on a large book. Empty = use every training window."></label>
+        <button id="tr-go" class="primary">Start training</button>
+      </div>
+      <p class="hint"><b>What happens:</b> the model reads each account's past daily values (up to 512 days) and learns
+        to predict the next 90 days as a range (10th–90th percentile). One <b>epoch</b> = one pass over a batch of
+        training windows; after each epoch it is checked on accounts it never trained on. If that check improves, the
+        weights are saved (✓). Lower error = better.</p>
+      <div id="tr-status"></div>
+      <div class="bar"><div id="tr-fill" class="fill"></div></div>
+      <div id="tr-chart" class="chart"></div>
+      <div class="table-wrap"><table id="tr-table"></table></div>
     </div>
   </section>
 </main>

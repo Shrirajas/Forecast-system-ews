@@ -157,6 +157,22 @@ def train_model(
 
     ckpt = Path(checkpoint_path or m.checkpoint_path)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
+    # Live progress for the console's Training tab (overwritten each run; small, so rewritten freely).
+    progress_path = ckpt.with_suffix(".progress.json")
+    progress: dict = {
+        "status": "running", "checkpoint": str(ckpt), "device": str(ctx.device), "epochs": m.epochs,
+        "steps_per_epoch": steps_per_epoch, "epoch": 0, "step": 0, "batch_size": m.batch_size,
+        "params": sum(p.numel() for p in model.parameters()), "train_windows": len(train_ds),
+        "val_windows": len(val_ds), "started_at": datetime.now().isoformat(timespec="seconds"), "history": [],
+    }
+
+    def save_progress(**upd) -> None:
+        progress.update(upd)
+        tmp = progress_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(progress))
+        tmp.replace(progress_path)  # atomic: the UI never reads a half-written file
+
+    save_progress()
     best, best_epoch, best_metrics = float("inf"), -1, {}
     for epoch in range(m.epochs):
         model.train()
@@ -177,6 +193,8 @@ def train_model(
                 opt_steps += 1
             running += float(loss.detach()) * past.shape[0]
             seen += past.shape[0]
+            if step % 10 == 0:
+                save_progress(epoch=epoch + 1, step=opt_steps, train_pinball_running=running / max(seen, 1))
             if opt_steps >= steps_per_epoch:
                 break
         metrics = evaluate(model, val_dl, ctx, cfg.max_horizon) if val_dl else {"pinball": running / max(seen, 1)}
@@ -184,7 +202,11 @@ def train_model(
             "epoch {}/{} train_pinball={:.4f} val={}",
             epoch + 1, m.epochs, running / max(seen, 1), {k: round(v, 4) for k, v in metrics.items()},
         )
-        if metrics["pinball"] < best:
+        improved = metrics["pinball"] < best
+        progress["history"].append({"epoch": epoch + 1, "train_pinball": running / max(seen, 1), **metrics,
+                                    "saved": improved, "seconds": round(time.perf_counter() - t0, 1)})
+        save_progress(epoch=epoch + 1, step=steps_per_epoch)
+        if improved:
             best, best_epoch, best_metrics = metrics["pinball"], epoch + 1, metrics
             torch.save(
                 {
@@ -214,5 +236,6 @@ def train_model(
         device=str(ctx.device),
     )
     ckpt.with_suffix(".json").write_text(json.dumps(asdict(result), indent=2))
+    save_progress(status="done", best_epoch=best_epoch, seconds=result.seconds)
     log("training done: {}", result)
     return result
