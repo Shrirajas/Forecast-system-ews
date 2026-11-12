@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from starlette.concurrency import run_in_threadpool
 
 from api.deps import Services, services
@@ -14,7 +14,7 @@ router = APIRouter(tags=["system"])
 
 
 @router.get("/health")
-async def health(svc: Annotated[Services, Depends(services)]) -> dict:
+async def health(request: Request, svc: Annotated[Services, Depends(services)]) -> dict:
     cache = svc.pipeline.cache.load()
     return {
         "status": "ok",
@@ -22,6 +22,8 @@ async def health(svc: Annotated[Services, Depends(services)]) -> dict:
         "cache_version": cache.meta.version if cache else None,
         "model_backend": svc.settings.model.backend,
         "model_loaded": svc.pipeline._engine is not None,
+        "dataset_id": svc.dataset_id,
+        "active_model": request.app.state.runtime.active_model,
     }
 
 

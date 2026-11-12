@@ -5,11 +5,13 @@ from __future__ import annotations
 from typing import Annotated
 
 import orjson
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from api.deps import Services, services
+from api.presentation import account_display
+from utils.timefmt import to_ist
 from api.schemas import PredictRequest, PredictResponse
 from models.pipeline import ScoreRequest
 
@@ -17,7 +19,7 @@ router = APIRouter(prefix="/api/v1", tags=["prediction"])
 
 
 @router.post("/predict/ews", response_model=PredictResponse, summary="Run the EWS forecast for a batch of accounts")
-async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(services)]) -> Response:
+async def predict_ews(req: PredictRequest, request: Request, svc: Annotated[Services, Depends(services)]) -> Response:
     """Runs the multivariate forecaster over the selected accounts (or the
     whole book) and returns, per account:
 
@@ -47,7 +49,8 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
         auto_refresh=False,  # refreshes happen after ingest / nightly, never inside a request
     )
     try:
-        out = await run_in_threadpool(svc.pipeline.score, sreq)
+        with svc.busy():
+            out = await run_in_threadpool(svc.pipeline.score, sreq)
     except FileNotFoundError as exc:
         raise HTTPException(503, str(exc)) from exc
     except RuntimeError as exc:
@@ -58,6 +61,9 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
     if req.persist_alerts and out.get("alerts"):
         svc.broker.publish(out["alerts"])
     accounts = out["accounts"]
+    spec = request.app.state.runtime.registry.get(svc.dataset_id or "")
+    for a in accounts:
+        a["display"] = account_display(a, spec, svc.settings.risk, out["horizon"])
     if req.tiers:
         wanted = set(req.tiers)
         accounts = [a for a in accounts if a["risk_tier"] in wanted]
@@ -66,7 +72,7 @@ async def predict_ews(req: PredictRequest, svc: Annotated[Services, Depends(serv
         "as_of_date": out["as_of_date"],
         "horizon": out["horizon"],
         "source": out["source"],
-        "scored_at": out["scored_at"],
+        "scored_at": to_ist(out["scored_at"]),
         "cache_version": out["cache_version"],
         "model_version": out["model_version"],
         "backend": out.get("backend"),

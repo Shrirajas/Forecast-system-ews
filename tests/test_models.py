@@ -125,11 +125,12 @@ def test_risk_engine_breach_day_tier_and_expected_loss():
     r = evaluate_risk(q_bal, q_util, emi, _snapshot(3, 60_000.0), RiskSettings())
     assert r.days_to_breach.tolist() == [45, -1, 10]
     assert r.tier.tolist() == ["SMA-1", "GREEN", "SMA-0"]
-    assert np.isnan(r.expected_loss[1])
+    # section 11: EL is computed for every credit product, so a GREEN account with a limit has one too
+    assert np.isclose(r.expected_loss[1], r.ead[1] * r.pd[1] * r.lgd[1])
     for i in (0, 2):
         assert np.isclose(r.expected_loss[i], r.ead[i] * r.pd[i] * r.lgd[i])
     assert r.pd[2] > r.pd[1]
-    assert r.priority[2] > 0 and r.priority[1] == 0
+    assert r.priority[2] > 0 and r.priority[1] > 0 and r.priority[2] > r.priority[1]
     # EAD uses the larger of current drawn and the q90 projected drawn amount
     assert np.isclose(r.ead[1], 500_000 + 0.3 * 100_000)
 

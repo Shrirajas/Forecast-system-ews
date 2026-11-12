@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from config.settings import QUANTILES
+from utils.timefmt import to_ist
 
 AccountId = Annotated[str, Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_\-]+$")]
 Money = Annotated[float, Field(ge=0)]
@@ -235,6 +236,7 @@ class AccountForecast(BaseModel):
     triggers: list[str]
     behavior: BehaviorOut
     forecast: ForecastPaths | None = None
+    display: dict[str, Any] | None = Field(None, description="Server-side labels: tier wording, N/A reasons, PD basis, triggers")
 
 
 class PredictSummary(BaseModel):
@@ -291,6 +293,13 @@ class AlertOut(BaseModel):
     projected_balance_drop: float | None
     cof_impact_annual: float | None
     triggers: list[str]
+    product_type: str | None = None
+    display: dict[str, Any] | None = None
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _ist(cls, v: Any) -> Any:  # stored as naive UTC; the API speaks IST
+        return datetime.fromisoformat(to_ist(v)) if v is not None else v
 
     @field_validator("triggers", mode="before")
     @classmethod

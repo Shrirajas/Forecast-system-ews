@@ -54,6 +54,42 @@ curl -s 'localhost:8000/api/v1/alerts/active?limit=20'
 curl -N 'localhost:8000/api/v1/alerts/active?stream=true&follow=true'   # Server-Sent Events
 ```
 
+## Web console: plug in your database and data
+
+Start the API (`python scripts/serve.py`) and open <http://localhost:8000/ui/> (or just
+<http://localhost:8000/>).
+
+| Tab | What you can do |
+|---|---|
+| **Overview** | See the database, the date range and accounts loaded, the model, and the latest book run (tiers, alerts, expected loss); start jobs. It also suggests the next step: import, train, or refresh. |
+| **Database** | Point the service at a DuckDB file or a PostgreSQL URL. **Test** creates the EWS tables if missing; **Use** switches over live and remembers the choice in `data/connection.json` across restarts. |
+| **Import data** | Upload a CSV or Parquet file, or run a `SELECT` against your own database (PostgreSQL and SQLite drivers included). Preview the rows, check the column mapping, then import. |
+| **Jobs** | Imports, refresh, book scoring and training run in the background, one at a time, with their status and results. |
+| **Alerts** | Ranked active alerts, with type and tier filters. Click an account to see its forecast. |
+| **Account forecast** | The q10–q90 balance band, the median and worst-case tracks, EMI due dates, tier, PD, EAD, expected loss and triggers. |
+
+**Column mapping.** Bank exports rarely use our column names, so the importer:
+
+* matches source columns to EWS columns automatically: known synonyms (`Acct No`, `acct`, `Account Number`
+  → `account_id`; `Bal Date` → `as_of_date`; `Closing Balance` → `eod_balance`; `Dr/Cr` → `direction`
+  …), then rules (any `…date`/`…dt` column for the table's date), then fuzzy matching;
+* reads every column as text and converts it itself. That handles:
+  * dates in ISO or a chosen format (`31/12/2024`, `12/31/2024`, `20241231`, `31-Dec-2024` …);
+  * thousands separators, decimal commas, currency symbols and `(1,234.00)` negatives;
+  * `D/C`, `DR/CR` and `Debit/Credit` codes, or the debit/credit taken from the sign of the amount;
+* fills columns you don't have from a constant you type, or a safe default (e.g. LGD 0.45). The account
+  master's `customer_id` copies `account_id`;
+* streams large files and query results in batches. Re-importing the same file or query changes nothing.
+
+**Minimum to get forecasts:** `daily_balances`. For EMI-based SMA alerts, also import `accounts` and
+`loan_schedules`. `transactions` and `credit_profiles` add salary, payment-return and bureau signals.
+Download a CSV template for any table from the Import tab or `GET /api/v1/import/template/{table}`.
+
+**Security.** The console's admin endpoints (switch database, import, train) answer only requests from the
+same machine, unless you set `EWS_ADMIN_ALLOW_REMOTE=true`. Do that only behind real authentication.
+A PostgreSQL password entered in the console is stored in `data/connection.json` with owner-only
+permissions; use a read-only database user for SQL imports.
+
 ## Layout
 
 | Path | Contents |
@@ -300,7 +336,7 @@ Measured in-process on Berka (4,500 accounts, 4-core CPU), with `scripts/bench_a
 ## Tests
 
 ```bash
-pytest -q                                                    # 32 tests: data engine, model, risk maths, API, TimesFM 3 adapter
+pytest -q                                                    # 54 tests: data engine, model, risk maths, API, console, TimesFM 3 adapter
 EWS_TEST_POSTGRES_DSN=postgresql+psycopg2://user@host/db pytest tests/test_postgres.py   # Postgres parity (drops EWS tables!)
 ```
 

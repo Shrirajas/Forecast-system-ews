@@ -106,7 +106,7 @@ needs it. Delete the `ray[default]` line from `requirements.txt` (or a copy of i
 pytest -q
 ```
 
-Expected: `45 passed, 1 skipped` (the skipped test needs a PostgreSQL server). Takes about 15 s.
+Expected: `54 passed, 1 skipped` (the skipped test needs a PostgreSQL server). Takes about 15 s.
 
 ## 5. Bring up the sandbox (synthetic data + trained model)
 
@@ -139,7 +139,7 @@ Useful options:
 python scripts/serve.py --port 8000
 ```
 
-Then open <http://localhost:8000/docs> for interactive API docs.
+Then open <http://localhost:8000/ui/> for the web console, or <http://localhost:8000/docs> for interactive API docs.
 
 At startup the server refreshes features and scores the whole book once, so the first whole-book
 request is already served from stored results.
@@ -176,6 +176,18 @@ Stop the server with `Ctrl+C`.
 > before running `bootstrap.py`, `train.py`, `backtest.py` or any other script that uses the same
 > database, or you'll get a "Could not set lock on file" error. For several processes at once, switch to
 > PostgreSQL (section 8).
+
+### Use your own data from the browser
+
+With the server running, open <http://localhost:8000/ui/>:
+
+1. **Database** tab (optional): keep the default DuckDB file, enter a new file path, or paste a PostgreSQL
+   URL. Click **Test**, then **Use this database**.
+2. **Import data** tab: pick the target table, then drop a CSV or Parquet file (or query your own database).
+   Check the column mapping and the date format, then click **Import**. Do `accounts` and
+   `loan_schedules` first, then `daily_balances`, keeping **Refresh & score afterwards** ticked on the last one.
+3. **Overview** tab: if no model exists yet, click **Train model**.
+4. **Alerts** and **Account forecast** tabs: see the results.
 
 ## 7. Real-data benchmark (Czech bank, Berka / PKDD'99)
 

@@ -88,7 +88,7 @@ and tell the user that `scripts/batch_score_ray.py` is unavailable. Do not commi
 pytest -q
 ```
 
-* **expect:** `45 passed, 1 skipped` (the skip is the opt-in PostgreSQL test). Any failure: stop and
+* **expect:** `54 passed, 1 skipped` (the skip is the opt-in PostgreSQL test). Any failure: stop and
   report the output.
 
 ## Step 6: bootstrap the sandbox
@@ -128,6 +128,8 @@ Wait until its output contains `Application startup complete`. Then, in another 
 | c | `curl -X POST http://localhost:8000/api/v1/predict/ews -H "content-type: application/json" -d "{\"account_ids\": [\"AC00000018\"]}"` | HTTP 200, `"source":"live"`, and the account has a `forecast` object |
 | d | `curl "http://localhost:8000/api/v1/alerts/active?limit=5"` | HTTP 200 with a `total` field and a ranked `alerts` list |
 | e | `curl -X POST http://localhost:8000/api/v1/predict/ews -H "content-type: application/json" -d "{\"horizon\": 45}"` | HTTP 422 (only 30, 60 or 90 are valid) |
+
+| f | `curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/ui/` | `200` (the web console) |
 
 Report each check's status code plus the `summary` block from (b). If the user wants the server left
 running, leave it running and give them <http://localhost:8000/docs>. Otherwise stop it before step 8.

@@ -49,6 +49,9 @@ class ScoreRequest:
     auto_refresh: bool = False
     #: Serve whole-book requests from the latest stored book run when it matches.
     use_stored: bool = True
+    #: Forecast backend for this request ("stformer" | "timesfm3"); None = the process default.
+    #: An unavailable backend raises EngineUnavailable, it is never replaced by another one.
+    backend: str | None = None
 
 
 @dataclass
@@ -64,6 +67,16 @@ class ScoredBatch:
     snapshot: AccountSnapshot
     risk: RiskResult
     behavior: BehaviorResult
+
+
+def bound_quantiles(q: np.ndarray, past: np.ndarray) -> np.ndarray:
+    """Physical bounds on raw quantiles ``[B, 2, H, 9]``: balances that never went negative stay >= 0,
+    utilisation lives in [0, MAX_UTILIZATION] (small over-limit allowed). Returns a bounded copy."""
+    q = q.copy()
+    nonneg = ~(np.nan_to_num(past[:, :, 0], nan=0.0) < 0).any(1)
+    q[:, 0] = np.where(nonneg[:, None, None], np.maximum(q[:, 0], 0.0), q[:, 0])
+    q[:, 1] = np.clip(q[:, 1], 0.0, MAX_UTILIZATION)
+    return q
 
 
 def _s(x: Any) -> str | None:
@@ -97,6 +110,11 @@ def _nest(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _nan_to_none(a: np.ndarray) -> list[float | None]:
+    """N/A (NaN, e.g. no credit exposure) must reach the alert as null, never as NaN (invalid JSON)."""
+    return [float(x) if np.isfinite(x) else None for x in a]
+
+
 def _day(x: int) -> int | None:
     return int(x) if x > 0 else None
 
@@ -122,6 +140,12 @@ class EWSPipeline:
         if self._engine is None:
             self._engine = get_engine(self.settings)
         return self._engine
+
+    def engine_for(self, backend: str | None = None) -> ForecastEngine:
+        """The engine for a per-request backend choice (None or the default = ``self.engine``)."""
+        if backend is None or backend == self.engine.name:
+            return self.engine
+        return get_engine(self.settings, backend)
 
     # ---- freshness ------------------------------------------------------------------------------
     def refresh(self, full: bool = False, force_cache: bool = False) -> dict[str, Any]:
@@ -165,8 +189,9 @@ class EWSPipeline:
         liability_quantile: float,
         asset_quantile: float,
         precomputed: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        engine: ForecastEngine | None = None,
     ) -> ScoredBatch:
-        eng = self.engine
+        eng = engine or self.engine
         L, Hp = eng.context_length, eng.horizon_pad
         acc = cache.accounts.iloc[rows]
         if precomputed is None:
@@ -178,11 +203,7 @@ class EWSPipeline:
         else:  # a longer forecast already made for these rows: the first `horizon` days are the same
             q_full, past, known = precomputed
             q = q_full[:, :, :horizon].copy()
-        # Physical bounds: deposit balances that never went negative stay >= 0;
-        # utilisation lives in [0, max_utilization] (small over-limit allowed).
-        nonneg = ~(np.nan_to_num(past[:, :, 0], nan=0.0) < 0).any(1)
-        q[:, 0] = np.where(nonneg[:, None, None], np.maximum(q[:, 0], 0.0), q[:, 0])
-        q[:, 1] = np.clip(q[:, 1], 0.0, MAX_UTILIZATION)
+        q = bound_quantiles(q, past)
 
         last = past[:, -1, :]
         cib = past[:, :, CIBIL_CH]
@@ -216,13 +237,14 @@ class EWSPipeline:
         triggers; paths for flagged accounts then need a forward pass over those
         accounts only. Everything else is scored live."""
         t0 = time.perf_counter()
+        eng = self.engine_for(req.backend)
         cache = self.loaded_cache(req.auto_refresh)
         as_of = req.as_of_date or cache.end
-        meta = {"cache_version": cache.meta.version, "model_version": self.engine.model_version,
-                "backend": self.engine.name}
+        meta = {"cache_version": cache.meta.version, "model_version": eng.model_version, "backend": eng.name,
+                "device": eng.describe().get("device", {}).get("device")}
         if req.account_ids is None and req.use_stored and req.paths != "all" and as_of == cache.end:
             run = self.alerts.latest_book_run(
-                cache.meta.version, req.horizon, req.liability_quantile, req.asset_quantile, self.engine.model_version
+                cache.meta.version, req.horizon, req.liability_quantile, req.asset_quantile, eng.model_version
             )
             if run is not None:
                 return self._from_stored(cache, run, req, t0, meta)
@@ -233,12 +255,13 @@ class EWSPipeline:
                 "scored_at": utcnow(), **meta, "unknown_accounts": unknown}
         if len(rows) == 0:
             return {**base, "accounts": [], "alerts": [], "summary": self._summary([], 0, t0)}
-        sb = self.score_rows(cache, rows, as_of, req.horizon, req.liability_quantile, req.asset_quantile)
+        sb = self.score_rows(cache, rows, as_of, req.horizon, req.liability_quantile, req.asset_quantile, engine=eng)
         scores = self.score_table(cache, sb, run_id)
         accounts = [_nest(r) for r in scores.to_pylist()]
         self._attach_paths(accounts, sb, np.arange(len(rows)), req)
         alerts = self.alert_table(cache, sb, run_id)
-        if req.persist_alerts:
+        # Only the default engine writes alerts: a zero-shot research backend must not feed the alert book.
+        if req.persist_alerts and eng is self.engine:
             scope = cache.accounts["account_id"].iloc[rows].tolist()
             self.alerts.record_run(self._run_row(run_id, as_of, req, len(rows), alerts), scope, alerts)
         alert_rows = alerts.to_pylist()
@@ -331,9 +354,9 @@ class EWSPipeline:
                     "risk_tier": r.tier[idx].tolist(),
                     "priority_score": (r.priority[idx] if kind == "CREDIT_EWS" else bh.cof_impact_annual[idx]).tolist(),
                     "current_balance": sb.snapshot.current_balance[idx].tolist(),
-                    "exposure_at_default": r.ead[idx].tolist(),
-                    "probability_of_default": r.pd[idx].tolist(),
-                    "loss_given_default": r.lgd[idx].tolist(),
+                    "exposure_at_default": _nan_to_none(r.ead[idx]),
+                    "probability_of_default": _nan_to_none(r.pd[idx]),
+                    "loss_given_default": _nan_to_none(r.lgd[idx]),
                     # EL lives on the credit alert only, so summing alerts never double counts
                     "expected_loss": [None if kind != "CREDIT_EWS" or not np.isfinite(x) else float(x)
                                       for x in r.expected_loss[idx]],
@@ -391,7 +414,7 @@ class EWSPipeline:
             "probability_of_default": num(r.pd, 4), "pd_cash_shortfall": num(r.pd_cash, 4),
             "pd_utilization_breach": num(r.p_util, 4), "pd_bureau": num(r.pd_bureau, 4),
             "exposure_at_default": num(r.ead), "loss_given_default": num(r.lgd, 4),
-            "expected_loss": num(r.expected_loss, hide=~in_sma), "priority_score": num(r.priority),
+            "expected_loss": num(r.expected_loss), "priority_score": num(r.priority),
             "cibil_score": num(sn.cibil, 0),
             "triggers": pa.array([json.dumps(t) for t in r.triggers]),
             "trailing_avg_balance_90d": num(bh.trailing_avg_90d), "baseline_avg_balance": num(bh.baseline_avg),

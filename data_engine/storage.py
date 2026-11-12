@@ -389,3 +389,14 @@ def reset_storage_cache() -> None:
         for adapter in _ADAPTERS.values():
             adapter.close()
         _ADAPTERS.clear()
+
+
+def release_storage(settings: Settings) -> bool:
+    """Close and forget the adapter of one database (a dataset switch releases the DuckDB file so other
+    processes can open it). Returns False when none was open."""
+    key = str(settings.storage.duckdb_path) if settings.storage.backend == "duckdb" else settings.storage.postgres_dsn
+    with _lock:
+        adapter = _ADAPTERS.pop((settings.storage.backend, key), None)
+    if adapter is not None:
+        adapter.close()
+    return adapter is not None

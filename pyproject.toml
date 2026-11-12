@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# `pytest` alone must not wander into data/ (root-owned folders with unreadable conftest.py),
+# generated artifacts, the local tool cache or the unrelated Next.js app.
+testpaths = ["tests"]
+norecursedirs = ["data", "artifacts", ".local", "app", "node_modules", ".git", ".unlazy", ".team"]
